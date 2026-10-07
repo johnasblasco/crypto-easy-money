@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1
-#
 # One image for everything: the dashboard (default command), the scanner, the
 # research studies and the engine trainer. Data and models live in mounted
 # volumes (see compose.yaml), never inside the image.
@@ -41,7 +39,7 @@ COPY --chown=app:app cryptopredict ./cryptopredict
 COPY --chown=app:app quant ./quant
 COPY --chown=app:app tests ./tests
 COPY --chown=app:app pytest.ini ./
-RUN mkdir -p data models && chown app:app data models
+RUN mkdir -p data models && chown app:app /app data models
 
 USER app
 EXPOSE 8000

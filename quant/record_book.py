@@ -17,6 +17,7 @@ Files: data/book/<SYMBOL>/<YYYY-MM-DD>.parquet (one per UTC day).
 from __future__ import annotations
 
 import argparse
+import os
 import time
 
 import numpy as np
@@ -64,18 +65,22 @@ def run(symbols, every: float, minutes: float | None = None):
     buf: dict = {s: [] for s in symbols}
     t_end = time.time() + minutes * 60 if minutes else None
     last_flush = time.time()
-    while t_end is None or time.time() < t_end:
-        t0 = time.time()
-        for s in symbols:
-            try:
-                buf[s].append(snapshot(s, session))
-            except requests.RequestException as exc:
-                print(f"{s}: {exc}", flush=True)
-        if time.time() - last_flush > 300 or (t_end and time.time() >= t_end):
-            flush(buf)
-            last_flush = time.time()
-        time.sleep(max(0.0, every - (time.time() - t0)))
-    flush(buf)
+    try:
+        while t_end is None or time.time() < t_end:
+            t0 = time.time()
+            for s in symbols:
+                try:
+                    buf[s].append(snapshot(s, session))
+                except requests.RequestException as exc:
+                    print(f"{s}: {exc}", flush=True)
+            if time.time() - last_flush > 300 or (t_end and time.time() >= t_end):
+                flush(buf)
+                last_flush = time.time()
+            time.sleep(max(0.0, every - (time.time() - t0)))
+    except KeyboardInterrupt:      # Ctrl+C, or SIGINT from `docker compose stop`
+        pass
+    finally:
+        flush(buf)                 # never lose the buffered snapshots
 
 
 def flush(buf: dict) -> None:
@@ -88,7 +93,9 @@ def flush(buf: dict) -> None:
             path.parent.mkdir(parents=True, exist_ok=True)
             if path.exists():
                 g = pd.concat([pd.read_parquet(path), g])
-            g.to_parquet(path, index=False)
+            tmp = path.with_suffix(".tmp")
+            g.to_parquet(tmp, index=False)
+            os.replace(tmp, path)          # atomic: a kill mid-write cannot truncate the day file
         rows.clear()
 
 

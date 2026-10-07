@@ -46,11 +46,11 @@ Run the tests with `pytest`.
 
 ## Run with Docker
 
-You need Docker Desktop (Mac/Windows) or Docker Engine with the Compose plugin
-(Linux). The image runs on Intel/AMD and Apple Silicon. Your downloaded data
-and trained models live in the `data/` and `models/` folders of the repo,
-mounted into the container. They survive rebuilds and are shared with a
-non-Docker install.
+You need Docker Desktop (Mac/Windows) or Docker Engine with Compose **2.24 or
+newer** (Linux; check with `docker compose version`). The image runs on
+Intel/AMD and Apple Silicon. Your downloaded data and trained models live in the
+`data/` and `models/` folders of the repo, mounted into the container. They
+survive rebuilds and are shared with a non-Docker install.
 
 ```bash
 cp .env.example .env               # optional: alert tokens and settings (see the file)
@@ -62,14 +62,19 @@ docker compose up -d
 docker compose logs -f web         # Ctrl+C stops following, not the app
 ```
 
-Any command from this README runs in the container when you prefix it with
-`docker compose run --rm web`. For example:
+Any `python -m ...` command in this README runs in the container if you put
+`docker compose run --rm web` in front of it. For example:
 
 ```bash
 docker compose run --rm web python -m cryptopredict.experiments   # models for the scanner (30-60 min)
 docker compose run --rm web python -m quant.data download          # research data (~3 GB in ./data)
-docker compose run --rm web python -m pytest -q                    # test suite
+docker compose run --rm web pytest -q                              # test suite
 ```
+
+Three exceptions:
+- **Dashboard:** use `docker compose up -d`, not `uvicorn`.
+- **CSV files:** the container only sees `./data` and `./models`. Put CSV files in `./data` and pass `--csv data/<file>.csv`.
+- **Outputs:** write them under `data/` or `models/`. Anything else disappears with the container.
 
 Long-running extras are Compose profiles. They restart automatically and read
 their settings from `.env`:
@@ -77,18 +82,36 @@ their settings from `.env`:
 ```bash
 docker compose --profile alerts up -d     # scanner every 15 min -> Telegram/Discord
 docker compose --profile recorder up -d   # forward order-book recorder for future research
-docker compose down                       # stop everything (data and models stay)
+docker compose --profile "*" down         # stop everything (data and models stay)
 ```
 
-To update after `git pull`: `docker compose build && docker compose up -d`.
+Plain `docker compose up -d` and `docker compose down` only touch the
+dashboard. If you use the extras, list them in `.env`, for example
+`COMPOSE_PROFILES=alerts`. Then the plain commands include them, including
+updates.
+
+**Updating.** The code is copied into the image, so rebuild after a
+`git pull` or after editing any `.py` file:
+
+```bash
+docker compose build && docker compose up -d
+```
 
 Notes:
+- **Network access:** the dashboard listens on this computer only (`127.0.0.1`), because it has no login. To reach it from other devices, set `BIND_ADDR=0.0.0.0` in `.env`. Do that only on a network you trust.
 - **Signal engine:** the dashboard's engine card needs `models/engine/`, made by `python -m quant.train_engine` after the research studies (see [Research engine](#research-engine--quant)). Until then it says "not trained yet".
-  - Its first load syncs every coin from Binance and can take a few minutes. After that it is incremental.
-- **Memory:** the dashboard needs about 1–2 GB. The research studies and `quant.train_engine` need about 8 GB, so raise Docker Desktop's memory limit (Settings → Resources) before running them.
-- **Linux file ownership:** the container runs as an unprivileged user with uid 1000. If your user id differs (`id -u`), set `HOST_UID` and `HOST_GID` in `.env` and rebuild, so files written to `data/` and `models/` stay yours.
+  - Its first load after each start syncs every coin from Binance and can take a few minutes.
+- **Memory:**
+  - the dashboard needs about 1–2 GB, or about 3 GB once the engine is trained;
+  - `quant.data download`, the research studies and `quant.train_engine` need about 8 GB.
+
+  Raise Docker Desktop's limit (Settings → Resources) before running those.
+- **File ownership on Linux:**
+  - **Docker Engine:** the container runs as an unprivileged user with uid 1000. If your user id differs (`id -u`), set `HOST_UID` and `HOST_GID` in `.env` and rebuild, so files written to `data/` and `models/` stay yours.
+  - **Rootless Docker, or Docker Desktop for Linux:** set both to `0` instead, because container root maps to your own user there.
+  - **Freeing space:** delete the *contents* of `data/`, not the folder. Docker would recreate it owned by root.
 - **`toomanyrequests` while building:** Docker Hub has rate-limited image pulls. Set `BASE_IMAGE=mirror.gcr.io/library/python:3.13-slim` in `.env` and build again.
-- **Pinned versions:** the image installs the exact package versions the tests passed with (`constraints.txt`). For the same versions natively: `pip install -r requirements.txt -c constraints.txt`.
+- **Pinned versions:** the image installs the exact package versions the tests passed with (`constraints.txt`). For the same versions natively, use Python 3.12 or newer (tested on 3.13) and run `pip install -r requirements.txt -c constraints.txt`. On older Python, use plain `requirements.txt`.
 
 ## Research engine — `quant/`
 

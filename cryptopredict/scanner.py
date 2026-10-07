@@ -229,7 +229,10 @@ def main(argv=None):
                 channels = send_alert(alert_text(row))
                 print(f"Alert sent for {row['symbol']} {row['interval']} via {', '.join(channels) or 'nothing (no channel configured)'}")
             except requests.RequestException as exc:
-                print(f"Could not send alert for {row['symbol']}: {exc}")
+                # str(exc) contains the request URL, i.e. the bot token or webhook secret.
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                print(f"Could not send alert for {row['symbol']}: {type(exc).__name__}"
+                      f"{f' (HTTP {status})' if status else ''}")
         time.sleep(args.watch * 60)
 
 

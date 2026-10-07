@@ -41,7 +41,7 @@ class Evidence:
     period: str = ""
     trades: int = 0
     ev_bps: float | None = None     # mean net return per trade
-    ev_ci90_bps: tuple | None = None
+    ev_p5_bps: float | None = None  # 5th percentile of the day-clustered bootstrap of that mean
     sharpe: float | None = None
     max_drawdown: float | None = None
     benchmark: str = ""
@@ -83,9 +83,10 @@ class TrendSpecialist:
     name = "daily_trend"
     horizon = "1 day (re-evaluated 00:00 UTC)"
 
-    def __init__(self, evidence: Evidence, target_vol: float = 0.5):
+    def __init__(self, evidence: Evidence, target_vol: float = 0.5, fetch_daily: bool = True):
         self.evidence = evidence
         self.target_vol = target_vol
+        self.fetch_daily = fetch_daily
         self.health = SignalHealth(self.name, mu0=0.0005, sigma=0.03)
 
     def evaluate(self, symbol: str, m1: pd.DataFrame, now: pd.Timestamp) -> Signal:
@@ -94,6 +95,14 @@ class TrendSpecialist:
 
         d = resample(m1, "1D")["close"]
         d = d[d.index <= now.floor("D")]           # only completed UTC days
+        if len(d.dropna()) < 200 and self.fetch_daily:
+            try:                                    # not enough local history: one API call
+                from .live import fetch_daily
+
+                d = fetch_daily(symbol)["close"]
+                d = d[d.index <= now.floor("D")]
+            except Exception:
+                pass
         S = ensemble(d)
         vol = ewma_vol(d)
         s, v = S.iloc[-1], vol.iloc[-1]
@@ -112,7 +121,7 @@ class TrendSpecialist:
 
 
 class ModelSpecialist:
-    """A trained, calibrated classifier with an EV-vs-cost decision rule.
+    """A trained, calibrated classifier with the decision rule it was validated with.
 
     Loaded from an artifact produced by ``quant.train_engine``. If the artifact
     says the configuration did not validate, it can still describe the market
@@ -166,10 +175,21 @@ class ModelSpecialist:
             reasons.append(f"specialist disabled by health monitor: {self.health.reason}")
         elif margin is None:
             reasons.append("no profitable threshold found in validation")
-        elif abs(edge) > rt + margin and (direction == "LONG" or self.cost.allow_short):
-            action = direction
         else:
-            reasons.append(f"edge does not clear cost + margin ({(rt + margin) * 1e4:.1f}bp)")
+            # Apply exactly the rule the margin was selected for in validation.
+            from .backtest import positions_from_ev, positions_from_prob
+
+            if self.a.get("decision", "ev") == "prob":
+                pos = int(positions_from_prob([p], margin, self.cost.allow_short)[0])
+                hurdle = f"|P(up) - 0.5| >= {margin:.3f}"
+            else:
+                pos = int(positions_from_ev(np.array([p]), np.array([sig]), np.array([rt]), margin,
+                                            self.cost.allow_short)[0])
+                hurdle = f"edge > cost + margin ({(rt + margin) * 1e4:.1f}bp)"
+            if pos != 0:
+                action = "LONG" if pos > 0 else "SHORT"
+            else:
+                reasons.append(f"decision rule not met: {hurdle}")
         return Signal(action=action, confidence=round(conf, 4), expected_edge_bps=round(edge * 1e4, 2),
                       cost_bps=round(rt * 1e4, 2), reasons=reasons, **base)
 

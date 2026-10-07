@@ -93,6 +93,17 @@ class LiveStore:
         return _gridded(self.raw[symbol])
 
 
+def fetch_daily(symbol: str, days: int = 400, session: requests.Session | None = None) -> pd.DataFrame:
+    """Completed UTC daily bars straight from Binance (one request), indexed by close time."""
+    s = session or requests.Session()
+    r = s.get(API, params={"symbol": symbol, "interval": "1d", "limit": min(days, 1000)}, timeout=15)
+    r.raise_for_status()
+    df = _to_frame(r.json())
+    df["ts"] = pd.to_datetime(df["open_time"] + 86_400_000, unit="ms", utc=True)
+    df = df.set_index("ts").drop(columns=["open_time"])
+    return df[df.index <= pd.Timestamp.now(tz="UTC")]   # drop the still-forming day
+
+
 def data_health(m1: pd.DataFrame, now: pd.Timestamp | None = None) -> dict:
     """Freshness and completeness of a live 1m frame; ``ok`` False means NO TRADE."""
     now = now or pd.Timestamp.now(tz="UTC")

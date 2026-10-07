@@ -94,7 +94,7 @@ def _fit_freeze(ds: Dataset, end: pd.Timestamp, factory, cost, decision: str, ca
     cal_rows, sel_rows = split_validation(ds.times, valid)
     cal = Calibrator(calibration).fit(model.predict_proba(X[cal_rows])[:, 1], y[cal_rows])
     p_sel = cal.transform(model.predict_proba(X[sel_rows])[:, 1])
-    skilled = has_skill(p_sel, y[sel_rows], float(np.mean(y[fit])))
+    skilled = has_skill(p_sel, y[sel_rows], float(np.mean(y[cal_rows])))   # same recent base rate as the backtest
     groups = ds.times[sel_rows].asi8
     margin = None
     if skilled:
@@ -144,12 +144,12 @@ def evaluate_candidate(c: dict) -> dict:
             pass
     passed = (len(act) >= 30 and np.isfinite(mean) and mean > 0 and p_day < 0.05 and np.isfinite(dsr) and dsr > 0.5)
     status = "VALIDATED" if passed else "NOT_VALIDATED"
-    ci = st.get("ev_ci90_bps")
     summary = (f"{c['description']} Holdout: {len(act)} trades, mean net {mean * 1e4 if np.isfinite(mean) else float('nan'):+.1f}bp "
                f"(day-clustered p={p_day:.3f}), Sharpe {st['sharpe_ann']:.2f}; research-period DSR {dsr:.2f} "
                f"over {len(trials)} trials. Verdict: {status} (pre-registered criteria).")
     evidence = Evidence(status=status, summary=summary, period=f"holdout {HOLDOUT_START} onward", trades=int(len(act)),
-                        ev_bps=float(mean * 1e4) if np.isfinite(mean) else None, ev_ci90_bps=ci,
+                        ev_bps=float(mean * 1e4) if np.isfinite(mean) else None,
+                        ev_p5_bps=float(lo * 1e4) if np.isfinite(lo) else None,
                         sharpe=st["sharpe_ann"], max_drawdown=st["max_drawdown"], benchmark="zero (flat) after costs",
                         notes=[f"validation slice {art['valid_period']}", f"skill gate passed: {art['skilled']}",
                                f"margin chosen on validation: {art['margin']}"])
@@ -163,6 +163,27 @@ def evaluate_candidate(c: dict) -> dict:
     return {"artifact": artifact, "holdout_stats": st, "evidence": asdict(evidence)}
 
 
+def informational_model(c: dict, research_summary: str) -> dict:
+    """A model that did NOT qualify for the holdout: fitted for display only, always NO TRADE."""
+    cost = COST_MODELS[c["cost"]]
+    parts = [make_dataset(s, c["horizon_min"], families=c["families"], holdout=True) for s in c["symbols"]]
+    ds = Dataset.pool(parts) if len(parts) > 1 else parts[0]
+    factory = getattr(models, c["model"])(**c.get("model_kwargs", {}))
+    live = _fit_freeze(ds, pd.Timestamp.now(tz="UTC"), factory, cost, c["decision"])
+    evidence = Evidence(status="NOT_VALIDATED", summary=research_summary, period="research 2020-2025-09",
+                        benchmark="zero (flat) after costs",
+                        notes=["did not meet the research-period criterion to be tested on the holdout",
+                               "shown for information only: the engine never trades it"])
+    return {"name": c["name"], "horizon_min": c["horizon_min"], "families": c["families"],
+            "columns": list(ds.X.columns), "model": live["model"], "calibrator": live["calibrator"],
+            "margin": None, "cost": c["cost"], "decision": c["decision"], "evidence": asdict(evidence),
+            "trade_sigma": 0.01, "symbols": c["symbols"]}
+
+
+# Models shown for information only (research verdict: statistically skilful, not cost-surviving).
+INFORMATIONAL: list[dict] = []
+
+
 def main():
     ENGINE_DIR.mkdir(parents=True, exist_ok=True)
     ev = trend_evidence()
@@ -172,6 +193,10 @@ def main():
         res = evaluate_candidate(c)
         joblib.dump(res["artifact"], ENGINE_DIR / f"{c['name']}.joblib")
         print(c["name"], res["evidence"]["status"], "|", res["evidence"]["summary"], flush=True)
+    for c in INFORMATIONAL:
+        art = informational_model(c, c["research_summary"])
+        joblib.dump(art, ENGINE_DIR / f"{c['name']}.joblib")
+        print(c["name"], "NOT_VALIDATED (informational)", flush=True)
 
 
 if __name__ == "__main__":

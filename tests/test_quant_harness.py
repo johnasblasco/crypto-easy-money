@@ -139,7 +139,7 @@ def test_simulate_charges_costs_on_changes():
     side = PERP.one_side("BTCUSDT")
     # turnover: enter 1, hold 0, exit 1, enter short 1, hold 0, flip 2, final close 1
     expected_turnover = 1 + 0 + 1 + 1 + 0 + 2 + 1
-    hold = PERP.holding(60) * 5   # 5 periods with a position
+    hold = PERP.holding(60) * 3   # funding only on the 3 long periods (shorts pay none)
     assert sim["cost"].sum() == pytest.approx(expected_turnover * side + hold)
     assert sim["gross"].sum() == pytest.approx(0.01 - 0.02 + 0.01 + 0.0 + 0.02)
     spot = simulate(pos, r, "BTCUSDT", SPOT, 60)

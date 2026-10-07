@@ -165,9 +165,13 @@ def day_bootstrap(ev: pd.DataFrame, value: str = "net", n_boot: int = 2000, seed
     pick = rng.integers(0, len(g), (n_boot, len(g)))
     means = s[pick].sum(1) / c[pick].sum(1)
     m = ev[value].mean()
-    centered = means - means.mean()
-    p = float(np.mean(centered >= m))
-    return float(m), max(p, 1 / n_boot), float(np.percentile(means, 5))
+    # Normal approximation with the day-clustered bootstrap standard error: unlike the
+    # empirical bootstrap tail it has no 1/n_boot floor, so Holm over many cells can reject.
+    from scipy import stats as _st
+
+    se = float(np.std(means, ddof=1))
+    p = float(1 - _st.norm.cdf(m / se)) if se > 0 else float("nan")
+    return float(m), p, float(np.percentile(means, 5))
 
 
 def summarize(ev: pd.DataFrame, pl: pd.DataFrame, rt_cost: float) -> dict:

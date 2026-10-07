@@ -104,13 +104,8 @@ def stats(r: pd.Series) -> dict:
 def alpha_vs(r: pd.Series, bench: pd.Series) -> dict:
     """OLS r = a + b*bench with Newey-West t-stat on alpha (daily)."""
     df = pd.concat([r, bench], axis=1).dropna()
-    y, x = df.iloc[:, 0].to_numpy(), df.iloc[:, 1].to_numpy()
-    X = np.column_stack([np.ones(len(x)), x])
-    beta = np.linalg.lstsq(X, y, rcond=None)[0]
-    resid = y - X @ beta
-    # HAC variance of alpha via the residual mean (alpha ~ mean of y - b x)
-    se = np.sqrt(M.newey_west_var(resid, lags=10) / len(resid))
-    return {"alpha_ann": float(beta[0] * 365), "beta": float(beta[1]), "alpha_t": float(beta[0] / se) if se > 0 else float("nan")}
+    beta, t, _ = M.hac_ols(df.iloc[:, 0].to_numpy(), df.iloc[:, 1].to_numpy().reshape(-1, 1), lags=10)
+    return {"alpha_ann": float(beta[0] * 365), "beta": float(beta[1]), "alpha_t": float(t[0])}
 
 
 def run_symbol(symbol: str, cost_name: str = "spot_taker", end: str = HOLDOUT_START, n_null: int = 500, seed: int = 0):
@@ -145,7 +140,7 @@ def run_symbol(symbol: str, cost_name: str = "spot_taker", end: str = HOLDOUT_ST
     null_sharpes = np.array(null_sharpes)
     out["null_sharpe_mean"] = float(null_sharpes.mean())
     out["null_sharpe_p95"] = float(np.percentile(null_sharpes, 95))
-    out["p_vs_random_timing"] = float((null_sharpes >= out["trend"]["sharpe"]).mean())
+    out["p_vs_random_timing"] = float(((null_sharpes >= out["trend"]["sharpe"]).sum() + 1) / (len(null_sharpes) + 1))
     # Stability by year
     by_year = {}
     for y in sorted(set(d.index.year)):

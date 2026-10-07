@@ -237,6 +237,25 @@ def diebold_mariano(loss_a, loss_b, lags: int | None = None) -> tuple[float, flo
     return float(d.mean()), float(1 - stats.norm.cdf(z))
 
 
+def hac_ols(y, X, lags: int):
+    """OLS with Newey-West (Bartlett) standard errors. Returns (beta, t, n). X excludes the constant."""
+    X = np.column_stack([np.ones(len(X)), np.asarray(X, float)])
+    y = np.asarray(y, float)
+    ok = np.isfinite(y) & np.isfinite(X).all(1)
+    y, X = y[ok], X[ok]
+    beta = np.linalg.lstsq(X, y, rcond=None)[0]
+    u = y - X @ beta
+    XtX_inv = np.linalg.inv(X.T @ X)
+    Xu = X * u[:, None]
+    S = Xu.T @ Xu
+    for L in range(1, lags + 1):
+        w = 1 - L / (lags + 1)
+        G = Xu[L:].T @ Xu[:-L]
+        S += w * (G + G.T)
+    V = XtX_inv @ S @ XtX_inv
+    return beta, beta / np.sqrt(np.diag(V)), int(len(y))
+
+
 def holm(pvalues) -> np.ndarray:
     p = np.asarray(pvalues, float)
     order = np.argsort(p)

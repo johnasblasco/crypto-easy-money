@@ -31,12 +31,12 @@ class FakeStore:
         return self.frames[symbol]
 
 
-def artifact(status="VALIDATED", p=0.9, margin=0.0, families=("cal",)):
+def artifact(status="VALIDATED", p=0.9, margin=0.0, families=("cal",), decision="ev"):
     cal = Calibrator("none").fit(np.array([0.4, 0.6]), np.array([0, 1]))
     return {
         "name": "test_model", "horizon_min": 60, "families": list(families),
         "columns": ["cal__hour_sin", "cal__hour_cos", "cal__weekend", "cal__dow_sin", "cal__dow_cos"],
-        "model": FixedModel(p), "calibrator": cal, "margin": margin, "cost": "perp_taker", "decision": "ev",
+        "model": FixedModel(p), "calibrator": cal, "margin": margin, "cost": "perp_taker", "decision": decision,
         "evidence": {"status": status, "summary": "test"}, "trade_sigma": 0.01,
     }
 
@@ -71,6 +71,16 @@ def test_unvalidated_specialist_never_trades(m1):
 def test_small_edge_is_no_trade(m1):
     spec = ModelSpecialist(artifact(p=0.501))
     assert spec.evaluate("BTCUSDT", m1, now_of(m1)).action == "NO TRADE"
+
+
+def test_prob_rule_uses_probability_margin_not_ev(m1):
+    # Under the "prob" rule the margin is a distance from 0.5, not a return hurdle.
+    assert ModelSpecialist(artifact(p=0.56, margin=0.05, decision="prob")).evaluate(
+        "BTCUSDT", m1, now_of(m1)).action == "LONG"
+    assert ModelSpecialist(artifact(p=0.53, margin=0.05, decision="prob")).evaluate(
+        "BTCUSDT", m1, now_of(m1)).action == "NO TRADE"
+    assert ModelSpecialist(artifact(p=0.40, margin=0.05, decision="prob")).evaluate(
+        "BTCUSDT", m1, now_of(m1)).action == "SHORT"
 
 
 def test_no_margin_from_validation_is_no_trade(m1):
@@ -123,7 +133,7 @@ def test_book_veto_blocks_actionable_signal(m1, monkeypatch):
 
 def test_trend_specialist_outputs_exposure(m1):
     ev = Evidence(status="RISK_OVERLAY", summary="test")
-    sig = TrendSpecialist(ev).evaluate("BTCUSDT", m1, now_of(m1))
+    sig = TrendSpecialist(ev, fetch_daily=False).evaluate("BTCUSDT", m1, now_of(m1))
     # 60 days of synthetic data is not enough for the 90-day Donchian -> NO TRADE with a reason
     assert sig.action == "NO TRADE" and sig.reasons
 

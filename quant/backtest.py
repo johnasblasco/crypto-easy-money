@@ -144,10 +144,13 @@ def _ev_and_se(net: np.ndarray, groups: np.ndarray | None) -> tuple[float, float
     return mean, se
 
 
-def round_trips(symbols, cost: CostModel, horizon_min: int) -> np.ndarray:
+def round_trips(symbols, cost: CostModel, horizon_min: int, side=1) -> np.ndarray:
+    """Round-trip cost per row (fees + impact both ways + funding for longs)."""
     symbols = np.atleast_1d(np.asarray(symbols, dtype=object))
-    table = {s: cost.round_trip(s) + cost.holding(horizon_min) for s in set(symbols)}
-    return np.array([table[s] for s in symbols])
+    table = {s: cost.round_trip(s) for s in set(symbols)}
+    rt = np.array([table[s] for s in symbols])
+    side = np.broadcast_to(np.asarray(side), rt.shape)
+    return rt + np.where(side > 0, cost.holding(horizon_min, 1), cost.holding(horizon_min, -1))
 
 
 EV_MARGINS = np.array([0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 15.0, 20.0, 30.0, 50.0]) / 1e4
@@ -172,15 +175,17 @@ def choose_ev_margin(p_valid, sigma_valid, r_valid, symbol, cost: CostModel, hor
                      min_trades: int = 30, z: float = 1.0, groups=None) -> tuple[float | None, dict]:
     """Like choose_threshold but the rule is 'expected edge > cost + margin'."""
     p_valid, sigma_valid, r_valid = (np.asarray(a, float) for a in (p_valid, sigma_valid, r_valid))
-    rt = round_trips(symbol if np.ndim(symbol) else [symbol] * len(p_valid), cost, horizon_min)
+    syms = symbol if np.ndim(symbol) else [symbol] * len(p_valid)
+    rt_long, rt_short = round_trips(syms, cost, horizon_min, 1), round_trips(syms, cost, horizon_min, -1)
     best, best_lcb, table = None, 0.0, {}
     for m in EV_MARGINS:
-        pos = positions_from_ev(p_valid, sigma_valid, rt, m, cost.allow_short)
+        pos = positions_from_ev(p_valid, sigma_valid, rt_long, m, cost.allow_short)
         active = pos != 0
         n = int(active.sum())
         if n < min_trades:
             table[float(m)] = {"n": n}
             continue
+        rt = np.where(pos > 0, rt_long, rt_short)
         net = pos[active] * r_valid[active] - rt[active]
         ev, se = _ev_and_se(net, None if groups is None else np.asarray(groups)[active])
         table[float(m)] = {"n": n, "ev": ev, "lcb": ev - z * se}
@@ -189,11 +194,21 @@ def choose_ev_margin(p_valid, sigma_valid, r_valid, symbol, cost: CostModel, hor
     return best, table
 
 
-def has_skill(p_valid, y_valid, base_rate: float, min_gain: float = 0.0) -> bool:
-    """Validation log loss must beat the training base rate (no demonstrated skill -> no trading)."""
-    from .metrics import log_loss
+def has_skill(p_valid, y_valid, base_rate: float, alpha: float = 0.10) -> bool:
+    """Demonstrated skill: validation log loss significantly below the base rate's.
 
-    return log_loss(y_valid, p_valid) < log_loss(y_valid, np.full(len(y_valid), base_rate)) - min_gain
+    One-sided Diebold-Mariano (HAC) test at level ``alpha``. ``base_rate`` should
+    be recent (the calibration slice), not a stale full-history average.
+    """
+    from .metrics import diebold_mariano
+
+    p = np.clip(np.asarray(p_valid, float), 1e-6, 1 - 1e-6)
+    y = np.asarray(y_valid, float)
+    b = np.clip(base_rate, 1e-6, 1 - 1e-6)
+    ll_model = -(y * np.log(p) + (1 - y) * np.log(1 - p))
+    ll_base = -(y * np.log(b) + (1 - y) * np.log(1 - b))
+    gain, pval = diebold_mariano(ll_base, ll_model)
+    return bool(np.isfinite(pval) and gain > 0 and pval < alpha)
 
 
 def choose_threshold(p_valid, r_valid, symbol, cost: CostModel, horizon_min: int,
@@ -206,7 +221,8 @@ def choose_threshold(p_valid, r_valid, symbol, cost: CostModel, horizon_min: int
     """
     p_valid = np.asarray(p_valid, float)
     r_valid = np.asarray(r_valid, float)
-    rt = round_trips(symbol if np.ndim(symbol) else [symbol] * len(p_valid), cost, horizon_min)
+    syms = symbol if np.ndim(symbol) else [symbol] * len(p_valid)
+    rt_long, rt_short = round_trips(syms, cost, horizon_min, 1), round_trips(syms, cost, horizon_min, -1)
     best, best_lcb, table = None, 0.0, {}
     for m in THRESHOLDS:
         pos = positions_from_prob(p_valid, m, cost.allow_short)
@@ -215,6 +231,7 @@ def choose_threshold(p_valid, r_valid, symbol, cost: CostModel, horizon_min: int
         if n < min_trades:
             table[float(m)] = {"n": n, "ev": float("nan"), "lcb": float("nan")}
             continue
+        rt = np.where(pos > 0, rt_long, rt_short)
         net = pos[active] * r_valid[active] - rt[active]
         ev, se = _ev_and_se(net, None if groups is None else np.asarray(groups)[active])
         lcb_total = (ev - z * se) * n  # total edge, lower bound
@@ -262,7 +279,7 @@ def walk_forward_predict(ds: Dataset, folds: list[Fold], model_factory, calibrat
         p_test_raw = model.predict_proba(X[test])[:, 1]
         p_test = cal.transform(p_test_raw)
         margin = None
-        skilled = has_skill(p_sel, y[sel_rows], float(np.mean(y[fit]))) if skill_gate else True
+        skilled = has_skill(p_sel, y[sel_rows], float(np.mean(y[cal_rows]))) if skill_gate else True
         groups = ds.times[sel_rows].asi8
         if decide and cost is not None and skilled:
             if decision == "ev":
@@ -274,7 +291,7 @@ def walk_forward_predict(ds: Dataset, folds: list[Fold], model_factory, calibrat
         if margin is None:
             pos = np.zeros(len(test), dtype=int)
         elif decision == "ev":
-            pos = positions_from_ev(p_test, sig[test], round_trips(ds.sym[test], cost, ds.horizon_min),
+            pos = positions_from_ev(p_test, sig[test], round_trips(ds.sym[test], cost, ds.horizon_min, 1),
                                     margin, cost.allow_short)
         else:
             pos = positions_from_prob(p_test, margin, cost.allow_short)
@@ -320,7 +337,8 @@ def simulate(pos: pd.Series, fwd_ret: pd.Series, symbol: str, cost: CostModel, h
     # (via turnover there) or at the very end / before a gap:
     next_gap = np.append(gap.to_numpy()[1:], True)
     closing = pos.abs() * next_gap
-    costs = (turnover + closing) * cost.one_side(symbol) + pos.abs() * cost.holding(horizon_min)
+    costs = (turnover + closing) * cost.one_side(symbol) + pos.clip(lower=0) * cost.holding(horizon_min, 1) \
+        + (-pos).clip(lower=0) * cost.holding(horizon_min, -1)
     gross = pos * r
     return pd.DataFrame({"pos": pos, "gross": gross, "cost": costs, "net": gross - costs})
 
@@ -328,26 +346,33 @@ def simulate(pos: pd.Series, fwd_ret: pd.Series, symbol: str, cost: CostModel, h
 # --------------------------------------------------------------- summarize
 
 def trading_stats(sim: pd.DataFrame, horizon_min: int, n_boot: int = 1000) -> dict:
-    """Per-trade statistics from rows; time-series statistics from the equal-weight portfolio."""
+    """Trade-level statistics (exit costs included) and portfolio time-series statistics.
+
+    Inference on mean net per trade bootstraps over calendar days, so trades
+    on correlated coins at the same time are not treated as independent.
+    """
+    from .events import day_bootstrap
+
     active = sim["pos"].to_numpy() != 0
-    act = sim["net"].to_numpy()[active]
     port = portfolio_returns(sim).to_numpy() if len(sim) else np.array([])
     periods_per_year = MINUTES_PER_YEAR / horizon_min
-    gains, losses = act[act > 0].sum(), -act[act < 0].sum()
-    p, lo, hi = M.mean_pvalue(act, n_boot=n_boot) if active.sum() >= 10 else (float("nan"),) * 3
-    entries = 0
-    for _, g in sim.groupby("sym", sort=False):
-        pos = g["pos"]
-        entries += int(((pos != 0) & (pos != pos.shift(1))).sum())
+    tr = trades(sim) if len(sim) else pd.DataFrame(columns=["sym", "ts", "side", "net"])
+    tn = tr["net"].to_numpy(float)
+    gains, losses = tn[tn > 0].sum(), -tn[tn < 0].sum()
+    if len(tr) >= 10:
+        mean, p, lo = day_bootstrap(tr.assign(ts=pd.to_datetime(tr["ts"], utc=True)), "net", n_boot=n_boot)
+    else:
+        mean, p, lo = (float("nan"),) * 3
     return {
         "periods": int(len(port)),
         "rows": int(len(sim)),
         "active_rows": int(active.sum()),
         "coverage": float(active.mean()) if len(sim) else 0.0,
-        "entries": entries,
-        "hit_rate": float((act > 0).mean()) if len(act) else float("nan"),
-        "ev_bps": float(act.mean() * 1e4) if len(act) else float("nan"),
-        "ev_ci90_bps": (float(lo * 1e4), float(hi * 1e4)) if np.isfinite(lo) else (float("nan"), float("nan")),
+        "trades": int(len(tr)),
+        "hit_rate": float((tn > 0).mean()) if len(tn) else float("nan"),
+        "ev_bps": float(tn.mean() * 1e4) if len(tn) else float("nan"),          # mean net per TRADE, all costs
+        "ev_per_period_bps": float(sim["net"].sum() / max(active.sum(), 1) * 1e4) if active.any() else float("nan"),
+        "ev_p5_bps": float(lo * 1e4) if np.isfinite(lo) else float("nan"),
         "ev_pvalue": p,
         "total_logret": float(port.sum()),
         "ann_return": float(np.expm1(port.mean() * periods_per_year)) if len(port) else 0.0,
@@ -391,8 +416,38 @@ def simulate_panel(pred: pd.DataFrame, cost: CostModel, horizon_min: int) -> pd.
 
 
 def portfolio_returns(sim: pd.DataFrame) -> pd.Series:
-    """Equal-weight across symbols per decision time (average of per-symbol net returns)."""
-    return sim.groupby(level=0)["net"].mean()
+    """Equal-weight portfolio log return per decision time (average SIMPLE returns, then log)."""
+    simple = np.expm1(sim["net"]).groupby(level=0).mean()
+    return np.log1p(simple)
+
+
+def trades(sim: pd.DataFrame) -> pd.DataFrame:
+    """Trade-level P&L: each run of an unchanged non-zero position, plus its exit cost.
+
+    The exit fee is charged on the row after a position closes (a flat row);
+    attributing it back to the trade avoids overstating per-trade edge. A flip
+    (+1 -> -1) charges both sides on the new trade's first row.
+    """
+    out = []
+    for sym, g in sim.groupby("sym", sort=False):
+        pos, net, idx = g["pos"].to_numpy(), g["net"].to_numpy(), g.index
+        cur, tid, start = 0, -1, None
+        acc = 0.0
+        for i in range(len(pos)):
+            if pos[i] != 0 and pos[i] != cur:
+                if tid >= 0 and cur != 0:
+                    out.append((sym, start, cur, acc))
+                tid += 1
+                start, acc = idx[i], 0.0
+            if pos[i] != 0:
+                acc += net[i]
+            elif cur != 0:            # first flat row after a trade: its cost is the exit
+                acc += net[i]
+                out.append((sym, start, cur, acc))
+            cur = pos[i]
+        if cur != 0:
+            out.append((sym, start, cur, acc))
+    return pd.DataFrame(out, columns=["sym", "ts", "side", "net"])
 
 
 def evaluate(ds: Dataset, pred: pd.DataFrame, cost: CostModel, n_boot: int = 1000) -> dict:

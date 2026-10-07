@@ -52,13 +52,21 @@ def regime_calibrated(ds, folds, factory):
 
 
 def specialised(ds, folds, factory):
-    """One model per volatility regime (fit on that regime's rows only)."""
+    """One model per volatility regime (fit on that regime's rows only) vs one global model.
+
+    Both are calibrated on the same full validation slice and scored on the same test
+    rows, so the comparison is row-aligned by construction (pooled panels repeat
+    timestamps across symbols, so aligning by time alone would be wrong).
+    """
     X, y = ds.X.to_numpy(float), ds.y.to_numpy()
     reg = ds.regimes["vol"].astype(str).to_numpy()
     rows = []
     for f in folds:
         if len(f.fit) < 100 or len(f.valid) < 30 or not len(f.test):
             continue
+        g = factory().fit(X[f.fit], y[f.fit])
+        p_global = Calibrator("platt").fit(g.predict_proba(X[f.valid])[:, 1], y[f.valid]).transform(
+            g.predict_proba(X[f.test])[:, 1])
         p = np.full(len(f.test), np.nan)
         for rv in np.unique(reg[f.test]):
             fm, vm, tm = reg[f.fit] == rv, reg[f.valid] == rv, reg[f.test] == rv
@@ -67,7 +75,8 @@ def specialised(ds, folds, factory):
             m = factory().fit(X[f.fit][fm], y[f.fit][fm])
             cal = Calibrator("platt").fit(m.predict_proba(X[f.valid][vm])[:, 1], y[f.valid][vm])
             p[tm] = cal.transform(m.predict_proba(X[f.test][tm])[:, 1])
-        rows.append(pd.DataFrame({"y": y[f.test], "p": p, "reg": reg[f.test]}, index=ds.times[f.test]))
+        rows.append(pd.DataFrame({"y": y[f.test], "p": p, "p_global": p_global, "reg": reg[f.test],
+                                  "sym": ds.sym[f.test]}, index=ds.times[f.test]))
     return pd.concat(rows)
 
 
@@ -98,13 +107,13 @@ def main(horizons=(240, 60)):
                                      "ece_global": M.ece(rc["y"], rc["p_global"]), "ece_regime": M.ece(rc["y"], rc["p_regime"])}
         # Q3: specialised models
         sp = specialised(ds, folds, fac).dropna(subset=["p"])
-        common = base.index.intersection(sp.index)
-        b2 = base[~base.index.duplicated()].reindex(sp.index)
-        ok = b2["p"].notna().to_numpy()
-        lb_, ls_ = ll_vec(sp["y"].to_numpy()[ok], b2["p"].to_numpy()[ok]), ll_vec(sp["y"].to_numpy()[ok], sp["p"].to_numpy()[ok])
+        yv = sp["y"].to_numpy()
+        lb_, ls_ = ll_vec(yv, sp["p_global"].to_numpy()), ll_vec(yv, sp["p"].to_numpy())
         d, p = M.diebold_mariano(lb_, ls_)
-        res["specialised_models"] = {"logloss_global": float(lb_.mean()), "logloss_specialised": float(ls_.mean()),
-                                     "gain": d, "p_specialised_better": p, "auc_specialised": M.auc(sp["y"], sp["p"])}
+        res["specialised_models"] = {"n": int(len(sp)), "logloss_global": float(lb_.mean()),
+                                     "logloss_specialised": float(ls_.mean()), "gain": d, "p_specialised_better": p,
+                                     "auc_global": M.auc(sp["y"], sp["p_global"]),
+                                     "auc_specialised": M.auc(sp["y"], sp["p"])}
         # Q4: agreement with the daily trend ensemble
         agree_rows = []
         for sym in ("BTCUSDT", "ETHUSDT"):

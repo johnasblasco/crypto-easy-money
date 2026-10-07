@@ -67,7 +67,7 @@ def quarter_hour(symbol: str):
         rz = (lc[times] - lc[times - H]) / (sig[times] * np.sqrt(H) + 1e-12)
         for h in (240, 480, 720):
             y = (lf[times + 1 + h] - lf[times + 1]) / (sig[times] * np.sqrt(h) + 1e-12)   # vol-normalised
-            beta, t, n = hac_ols(y, np.column_stack([oiq, tiall, rz]), lags=h // 60 + 1)
+            beta, t, n = hac_ols(y, np.column_stack([oiq, tiall, rz]), lags=2 * (h // 60) + 2)
             res[f"H{H // 60}h_h{h // 60}h"] = {"b_OIq": round(beta[1], 4), "t_OIq": round(t[1], 2),
                                               "b_TIall": round(beta[2], 4), "t_TIall": round(t[2], 2),
                                               "b_r": round(beta[3], 4), "t_r": round(t[3], 2), "n": n}
@@ -91,7 +91,7 @@ def stablecoin_premium():
     out = {}
     for hd in (1, 3):
         y = lb.reindex(days + pd.Timedelta(minutes=1 + 1440 * hd)).to_numpy() - lb.reindex(days + pd.Timedelta(minutes=1)).to_numpy()
-        beta, t, n = hac_ols(y, np.column_stack([prem * 1e4, dprem * 1e4, uimb]), lags=hd + 2)
+        beta, t, n = hac_ols(y, np.column_stack([prem * 1e4, dprem * 1e4, uimb]), lags=2 * hd + 2)
         out[f"btc_{hd}d"] = {"b_prem_bps": float(beta[1]), "t_prem": round(t[1], 2), "b_dprem_bps": float(beta[2]),
                             "t_dprem": round(t[2], 2), "b_usdc_imb": float(beta[3]), "t_usdc_imb": round(t[3], 2), "n": n}
     return out

@@ -4,9 +4,12 @@ Defaults are deliberately on the conservative side of retail Binance costs:
 
 * spot: 0.10% taker fee per side, plus half-spread and slippage
 * USDT-M perpetual: 0.05% taker fee per side, plus half-spread and slippage,
-  plus a funding charge per 8h held (historical average funding is positive,
-  so longs usually pay; we charge both sides to stay conservative because
-  funding history is not available here)
+  plus a funding charge per 8h held by LONG positions (historical average
+  funding is positive, so longs usually pay; shorts' funding income is not
+  credited)
+* perp maker: an UPPER BOUND only -- it assumes every limit order fills at the
+  next minute's VWAP, ignoring non-fills and adverse selection. Never used to
+  validate a signal.
 """
 from __future__ import annotations
 
@@ -34,8 +37,15 @@ class CostModel:
     def round_trip(self, symbol: str) -> float:
         return 2 * self.one_side(symbol)
 
-    def holding(self, minutes: float) -> float:
-        """Carry cost (funding) for holding a position ``minutes``."""
+    def holding(self, minutes: float, side: int = 1) -> float:
+        """Carry cost (funding) for holding a position ``minutes``.
+
+        Historically perp funding is mostly positive (longs pay shorts). Longs are
+        charged the assumed rate; shorts are charged nothing (conservative: in
+        practice they usually receive funding, which we do not credit).
+        """
+        if side < 0:
+            return 0.0
         return self.funding_bps_per_8h / 1e4 * minutes / 480.0
 
 

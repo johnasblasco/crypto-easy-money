@@ -55,6 +55,15 @@ python -m quant.data download --symbols PEPEUSDT SHIBUSDT BONKUSDT   # 1-minute 
 ENGINE_SYMBOLS=BTCUSDT,ETHUSDT,PEPEUSDT,SHIBUSDT uvicorn app.server:app   # coins on the engine card
 ```
 
+The engine's trend overlay only sizes coins it has been tested on. To test it on
+meme coins, download their history, then run the meme study and retrain the
+engine. The full list of 21 memes is `MEMES` in `quant/studies/meme_coins.py`.
+
+```bash
+python -m quant.studies.meme_coins     # tests the overlay on every downloaded meme coin
+python -m quant.train_engine           # the engine then covers the coins that were tested
+```
+
 In Docker, put `docker compose run --rm web` in front of the commands, and set `ENGINE_SYMBOLS` in `.env`.
 
 What is different about meme coins (measured on Binance data, October 2026):

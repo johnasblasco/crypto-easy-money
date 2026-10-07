@@ -44,6 +44,61 @@ with any CSV that has `timestamp,open,high,low,close,volume` columns.
 
 Run the tests with `pytest`.
 
+## Research engine — `quant/`
+
+The `cryptopredict/` app above is the original classroom project. `quant/` is
+the research-grade follow-up: an evidence-gated **signal engine** whose default
+output is **NO TRADE**. It only signals when a specialist passed a
+pre-registered out-of-sample test after realistic costs, its data is fresh, and
+a live health monitor hasn't disabled it. The full study, including what
+failed, is in **[docs/RESEARCH_REPORT.md](docs/RESEARCH_REPORT.md)**.
+
+```bash
+# 1. Data: 1-minute Binance klines for 16 coins since 2020 (~3 GB, resumable)
+python -m quant.data download
+python -m quant.data check                 # gaps, outages, bad bars
+
+# 2. Research studies (each writes data/results/<study>.json; research period only)
+python -m quant.studies.trend              # daily trend vs vol-targeted hold vs random timing
+python -m quant.studies.intraday_conversion
+python -m quant.studies.event_hypotheses   # sweeps, cascades, flow reversals, breakouts...
+python -m quant.studies.execution_realism  # aggressor-side fills, state-dependent spreads
+python -m quant.studies.daily_panel 3      # pooled daily ML panel, 3-day horizon
+python -m quant.report                     # collate results into markdown tables
+
+# 3. Freeze candidates, evaluate each ONCE on the locked holdout, write models/engine/
+python -m quant.train_engine
+
+# 4. Dashboard: the "Signal engine" card shows a verdict per coin
+uvicorn app.server:app
+```
+
+How to read the engine's output:
+
+- **Verdict per coin:** LONG / SHORT only if a *validated* specialist fires. Everything else is NO TRADE, with the reason:
+  - insufficient or stale data
+  - validated specialists disagree
+  - no validated edge clears costs right now
+- **Specialist status:**
+  - **VALIDATED:** passed the pre-registered holdout criteria.
+  - **RISK_OVERLAY:** reduces drawdowns but isn't proven alpha. Its "exposure" is a position-size guide, not a trade.
+  - **NOT_VALIDATED:** shown for information only; it never trades.
+- **Views agree / conflict:** whether every specialist's directional lean, tradeable or not, points the same way.
+- **Entry windows:** research always entered 1 minute after the decision. A signal whose window has passed is NO TRADE until the next decision.
+- **Health:** each specialist runs a CUSUM degradation monitor on its live trade results and switches itself off when its edge decays.
+
+Settings for `/api/engine`:
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `ENGINE_SYMBOLS` | Comma-separated coins to evaluate | all 16 |
+| `ENGINE_BOOK=0` | Skip the live order-book liquidity veto | on |
+| `ENGINE_TTL` | Seconds to cache the result | 300 |
+
+Order-book hypotheses can't be tested on history (no historical books are
+available), so record books going forward and test them later:
+`python -m quant.record_book --symbols BTCUSDT ETHUSDT SOLUSDT --every 10`.
+
 ## How it works
 
 ```
@@ -250,8 +305,20 @@ cryptopredict/
   experiments.py many tokens x intervals x horizons, with multiple-comparison correction
   scanner.py     live BUY/AVOID/WAIT signals + Telegram/Discord alerts
   predict.py     next-candle prediction + CLI
+quant/           research harness and signal engine (see docs/RESEARCH_REPORT.md)
+  data.py        1m kline download/load, quality report, Fear & Greed
+  labels.py      next-minute VWAP fills, forward returns
+  features.py    point-in-time feature families (flow, shape, momentum, trend, ...)
+  validation.py  purged walk-forward folds
+  backtest.py    calibration, skill gate, NO-TRADE margins, cost-aware simulation
+  metrics.py     calibration, bootstrap, deflated Sharpe, PBO, Diebold-Mariano, HAC
+  events.py      event-study machinery with matched placebos
+  monitor.py     CUSUM degradation monitor
+  engine.py      specialists, consensus verdicts, live gates
+  train_engine.py frozen candidates, one-time holdout evaluation
+  studies/       every experiment, including the ones that failed
 app/
-  server.py      FastAPI backend (/api/dashboard, /api/scanner)
+  server.py      FastAPI backend (/api/dashboard, /api/scanner, /api/engine)
   static/        dashboard HTML/CSS/JS + vendored chart library
 tests/           unit and end-to-end tests
 ```

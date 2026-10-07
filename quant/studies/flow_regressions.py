@@ -24,24 +24,6 @@ from quant.experiment import HOLDOUT_START, m1_frame, save
 from quant.labels import fill_prices
 
 
-def hac_ols(y, X, lags):
-    """OLS with Newey-West standard errors. Returns (beta, t-stats)."""
-    X = np.column_stack([np.ones(len(X)), X])
-    ok = np.isfinite(y) & np.isfinite(X).all(1)
-    y, X = y[ok], X[ok]
-    beta = np.linalg.lstsq(X, y, rcond=None)[0]
-    u = y - X @ beta
-    n, k = X.shape
-    XtX_inv = np.linalg.inv(X.T @ X)
-    S = (X * u[:, None]).T @ (X * u[:, None])
-    for L in range(1, lags + 1):
-        w = 1 - L / (lags + 1)
-        G = (X[L:] * u[L:, None]).T @ (X[:-L] * u[:-L, None])
-        S += w * (G + G.T)
-    V = XtX_inv @ S @ XtX_inv
-    return beta, beta / np.sqrt(np.diag(V)), int(n)
-
-
 def quarter_hour(symbol: str):
     m1 = m1_frame(symbol)
     m1 = m1[m1.index < pd.Timestamp(HOLDOUT_START, tz="UTC") - pd.Timedelta(days=1)]
@@ -56,8 +38,9 @@ def quarter_hour(symbol: str):
     lc = np.log(m1["close"]).ffill().to_numpy()
     lf = fill_prices(m1).ffill().to_numpy()
     sig = np.sqrt(pd.Series(np.diff(lc, prepend=lc[0]) ** 2).ewm(halflife=1440, min_periods=1440).mean().to_numpy())
-    times = np.arange(1440 * 30, len(m1) - 13 * 60, 60)
-    times = times[m1.index[times].minute == 0]
+    # Hourly samples on the hour (close-time index), after a 30-day warm-up.
+    times = np.flatnonzero(m1.index.minute == 0)
+    times = times[(times >= 1440 * 30) & (times < len(m1) - 13 * 60)]
     res = {}
     for H in (240, 720):
         e = times + 1
@@ -67,7 +50,7 @@ def quarter_hour(symbol: str):
         rz = (lc[times] - lc[times - H]) / (sig[times] * np.sqrt(H) + 1e-12)
         for h in (240, 480, 720):
             y = (lf[times + 1 + h] - lf[times + 1]) / (sig[times] * np.sqrt(h) + 1e-12)   # vol-normalised
-            beta, t, n = hac_ols(y, np.column_stack([oiq, tiall, rz]), lags=2 * (h // 60) + 2)
+            beta, t, n = M.hac_ols(y, np.column_stack([oiq, tiall, rz]), lags=2 * (h // 60) + 2)
             res[f"H{H // 60}h_h{h // 60}h"] = {"b_OIq": round(beta[1], 4), "t_OIq": round(t[1], 2),
                                               "b_TIall": round(beta[2], 4), "t_TIall": round(t[2], 2),
                                               "b_r": round(beta[3], 4), "t_r": round(t[3], 2), "n": n}
@@ -91,7 +74,7 @@ def stablecoin_premium():
     out = {}
     for hd in (1, 3):
         y = lb.reindex(days + pd.Timedelta(minutes=1 + 1440 * hd)).to_numpy() - lb.reindex(days + pd.Timedelta(minutes=1)).to_numpy()
-        beta, t, n = hac_ols(y, np.column_stack([prem * 1e4, dprem * 1e4, uimb]), lags=2 * hd + 2)
+        beta, t, n = M.hac_ols(y, np.column_stack([prem * 1e4, dprem * 1e4, uimb]), lags=2 * hd + 2)
         out[f"btc_{hd}d"] = {"b_prem_bps": float(beta[1]), "t_prem": round(t[1], 2), "b_dprem_bps": float(beta[2]),
                             "t_dprem": round(t[2], 2), "b_usdc_imb": float(beta[3]), "t_usdc_imb": round(t[3], 2), "n": n}
     return out

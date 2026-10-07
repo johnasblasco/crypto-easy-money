@@ -59,6 +59,17 @@ CANDIDATES: list[dict] = [
                        "when calibrated confidence clears the margin chosen on validation (research: mostly "
                        "market-timing calls on a few dates).",
     },
+    {
+        # Idea: intraday direction model (order flow, bar shape, momentum, ...). Variant chosen among the
+        # 24 intraday_conversion trials: positive research net EV, >= 100 trades, lowest p-value.
+        # ETH 4h, perp costs, EV-vs-cost rule: 130 trades, +20.6bp/trade, p=0.052; DSR 0.50, PBO 0.56.
+        "name": "eth_4h_flow_model", "study": "intraday_conversion", "ledger_id": "c9758efaeebb", "horizon_min": 240,
+        "families": ["mom", "vol", "act", "flow", "shape", "range", "regime", "cal", "ta", "xa"],
+        "symbols": ["ETHUSDT"], "model": "lightgbm", "cost": "perp_taker", "decision": "ev",
+        "description": "LightGBM on 1-minute order-flow, bar-shape and momentum features for ETH, 4-hour hold, "
+                       "long/short perps; it trades only when expected edge clears round-trip cost plus a "
+                       "validated margin.",
+    },
 ]
 
 EVENT_CANDIDATES: list[dict] = [

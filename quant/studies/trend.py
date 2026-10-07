@@ -84,7 +84,10 @@ def backtest_weights(w: pd.Series, d: pd.DataFrame, symbol: str, cost) -> pd.Ser
     w = w.clip(0, 1).fillna(0)
     gross = w * (np.expm1(fwd))                       # simple return on the risky fraction
     turnover = (w - w.shift(1).fillna(0)).abs()
-    net_simple = gross - turnover * cost.one_side(symbol)
+    side = cost.one_side(symbol)
+    if isinstance(side, pd.Series):          # a per-day cost (e.g. tick-size dependent)
+        side = side.reindex(w.index)
+    net_simple = gross - turnover * side
     return np.log1p(net_simple).where(fwd.notna())
 
 

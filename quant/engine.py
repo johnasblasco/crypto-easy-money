@@ -46,6 +46,7 @@ class Evidence:
     max_drawdown: float | None = None
     benchmark: str = ""
     notes: list = field(default_factory=list)
+    universe: list = field(default_factory=list)   # coins the evidence covers (empty: not recorded)
 
 
 @dataclass
@@ -85,6 +86,10 @@ class TrendSpecialist:
     horizon = "1 day (re-evaluated 00:00 UTC)"
     horizon_min = 1440
     cost_name = "spot_taker"
+    # Daily rebalancing: a one-tick spread on sub-cent memes (~25 bp) was charged in the meme-coin
+    # study and the rule still held; minute-scale specialists keep the 5 bp / 10 bp defaults.
+    max_spread_bps = 50.0
+    max_impact_bps = 50.0
 
     def __init__(self, evidence: Evidence, target_vol: float = 0.5, fetch_daily: bool = True):
         self.evidence = evidence
@@ -96,6 +101,9 @@ class TrendSpecialist:
         from .data import resample
         from .studies.trend import ensemble, ewma_vol
 
+        if self.evidence.universe and symbol not in self.evidence.universe:
+            return Signal(symbol, self.name, "NO TRADE", self.horizon, str(now), evidence=asdict(self.evidence),
+                          reasons=["the trend rule was not tested on this coin"])
         d = resample(m1, "1D")["close"]
         d = d[d.index <= now.floor("D")]           # only completed UTC days
         if len(d.dropna()) < 200 and self.fetch_daily:
@@ -351,7 +359,7 @@ class Engine:
                     book = {"ok": False, "problems": [f"order book unavailable: {exc}"]}
             regime = regime_snapshot(m1)
             for spec in self.specialists:
-                universe = getattr(spec, "a", {}).get("symbols")
+                universe = getattr(spec, "a", {}).get("symbols") or spec.evidence.universe or None
                 if universe is not None and sym not in universe:
                     continue                       # never applied outside the universe it was tested on
                 try:
@@ -367,9 +375,9 @@ class Engine:
                 if not health["ok"]:
                     veto = health["problems"][0]
                     sig.action, sig.reasons = "NO TRADE", health["problems"] + sig.reasons
-                elif book is not None and not book["ok"] and sig.action in ("LONG", "SHORT"):
-                    veto = book["problems"][0]
-                    sig.action, sig.reasons = "NO TRADE", book["problems"] + sig.reasons
+                elif sig.action in ("LONG", "SHORT") and (problem := book_veto(book, spec)):
+                    veto = problem
+                    sig.action, sig.reasons = "NO TRADE", [problem] + sig.reasons
                 d = sig.to_dict()
                 d["veto"] = veto
                 if (self.paper is not None and d["action"] in ("LONG", "SHORT")
@@ -379,6 +387,22 @@ class Engine:
                 d["book"] = book
                 out.append(d)
         return out
+
+
+def book_veto(book: dict | None, spec) -> str | None:
+    """Liquidity veto with the specialist's own limits (a daily overlay tolerates more spread than an intraday trade)."""
+    if book is None:
+        return None
+    if "spread_bps" not in book:                     # book unavailable or empty
+        return (book.get("problems") or ["order book unavailable"])[0]
+    max_spread = getattr(spec, "max_spread_bps", 5.0)
+    max_impact = getattr(spec, "max_impact_bps", 10.0)
+    if book["spread_bps"] > max_spread:
+        return f"spread {book['spread_bps']:.1f}bp > {max_spread:g}bp"
+    worst = max(book["buy_impact_bps"], book["sell_impact_bps"])
+    if worst > max_impact:
+        return f"filling the order would cost {worst:.1f}bp > {max_impact:g}bp"
+    return None
 
 
 def consensus(signals: list[dict]) -> list[dict]:

@@ -303,3 +303,21 @@ def test_unvalidated_trend_rule_never_suggests_exposure_as_action(m1):
     ev = Evidence(status="NOT_VALIDATED", summary="x")
     sig = TrendSpecialist(ev, fetch_daily=False).evaluate("BTCUSDT", synthetic_m1(days=260, seed=2), now_of(m1))
     assert sig.action in ("NO TRADE", "FLAT")
+
+
+def test_trend_rule_is_not_applied_to_untested_coins(m1):
+    ev = Evidence(status="RISK_OVERLAY", summary="x", universe=["BTCUSDT"])
+    spec = TrendSpecialist(ev, fetch_daily=False)
+    assert spec.evaluate("PEPEUSDT", m1, now_of(m1)).action == "NO TRADE"
+    eng = Engine(["PEPEUSDT"], [spec], store=FakeStore({"PEPEUSDT": m1}), use_book=False)
+    assert eng.run(now=now_of(m1), sync=False) == []
+
+
+def test_book_veto_limits_depend_on_the_specialist():
+    from quant.engine import book_veto
+
+    book = {"ok": False, "problems": ["spread 24.6bp > 5bp"], "spread_bps": 24.6, "buy_impact_bps": 13.0,
+            "sell_impact_bps": 12.0}
+    assert book_veto(book, ModelSpecialist(artifact(p=0.9))).startswith("spread 24.6bp")   # intraday: veto
+    assert book_veto(book, TrendSpecialist(Evidence(status="RISK_OVERLAY", summary="x"), fetch_daily=False)) is None
+    assert book_veto({"ok": False, "problems": ["empty order book"]}, ModelSpecialist(artifact(p=0.9))) == "empty order book"

@@ -44,6 +44,36 @@ with any CSV that has `timestamp,open,high,low,close,volume` columns.
 
 Run the tests with `pytest`.
 
+## Other coins and meme coins
+
+Any Binance spot pair works; pass its symbol:
+
+```bash
+python -m cryptopredict.train --source binance --symbol PEPEUSDT --interval 1h
+python -m cryptopredict.experiments --symbols PEPEUSDT SHIBUSDT BONKUSDT WIFUSDT --intervals 1h 4h   # for the scanner
+python -m quant.data download --symbols PEPEUSDT SHIBUSDT BONKUSDT   # 1-minute history for the research engine
+ENGINE_SYMBOLS=BTCUSDT,ETHUSDT,PEPEUSDT,SHIBUSDT uvicorn app.server:app   # coins on the engine card
+```
+
+In Docker, put `docker compose run --rm web` in front of the commands, and set `ENGINE_SYMBOLS` in `.env`.
+
+What is different about meme coins (measured on Binance data, October 2026):
+
+- **Trading costs are higher.** A coin priced at $0.000004 can only move in steps of one "tick", and the spread can never be smaller than one tick. For PEPE, BONK and SHIB that is 18–29 bp, more than the exchange fee. The app adds half a tick per side to every backtest automatically.
+- **Accuracy looks better than it is.** On PEPE the classroom model is about 55% "accurate", but that is because most hourly candles close flat or down as the price bounces between ticks. "Always DOWN" scores 57%, so the edge check says NO EDGE. Judge a model by the edge check and the chart's scoreboard, not by its accuracy.
+- **Holding them was brutal.** 22 meme coins are still trading on Binance:
+  - 17 of them lost money per year since listing;
+  - every one fell 79–99% from a peak at some point;
+  - from October 2025 to October 2026, an equal-weight basket of them lost 51%.
+
+  Dead and delisted memes aren't in the data, so reality was worse.
+- **The trend overlay held up on memes it had never seen.**
+  - Its worst drawdown was −28%, versus −94% for buy & hold.
+  - Over the last year it lost 3.6%, while buy & hold lost 51%.
+
+  It limits losses; it does not make memes profitable. The engine applies it only to the 37 coins it was tested on and says so for any other coin.
+- **No short-term meme trading signal was validated.**
+
 ## Run with Docker
 
 You need Docker Desktop (Mac/Windows) or Docker Engine with Compose **2.24 or

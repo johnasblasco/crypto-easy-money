@@ -21,6 +21,8 @@ What the data *does* support:
 3. **A slow daily trend rule is a robust *risk overlay*.** It held up on the holdout:
    - max drawdown −22% versus −54% for a volatility-targeted hold, in a falling market;
    - its timing alpha is suggestive but not statistically established.
+
+   It also held up on 22 meme coins it had never seen. Their worst drawdown fell from −94% (buy & hold) to −28%, and over the last year the loss fell from −51% to −3.6% (§4.9).
 4. **The most promising-looking short-term signal was a decaying anomaly.**
    - Buying an altcoin after a forced, one-sided sell-off earned +33 bp per event net in 2020–2025, mostly in 2020–21.
    - On the holdout it lost −13.5 bp per event over 303 events.
@@ -87,6 +89,7 @@ The working assumption was that the obvious answers are probably wrong, such as 
 | Quarter-hour opening imbalance | Weak continuation (t ≈ 2 at 4h); fails Holm; tiny effect | — |
 | Stablecoin premium → BTC | t = −3.4 at first; a trading-halt artifact plus the March 2023 USDC de-peg (t = −1.1 on real trading days) | — |
 | Regime specialists / regime calibration | Worse than one global model (DM p ≈ 1) | — |
+| Daily trend overlay on 22 meme coins (new assets, rule unchanged) | Drawdown −26% vs −50% (vol-targeted) and −93% (buy & hold) | **Overlay holds:** −3.6%/yr vs −50.6%/yr buy & hold; drawdown −16% vs −74% |
 
 ### 4.2 Short-horizon direction: real information, no profit
 
@@ -257,6 +260,49 @@ Pooling coins does not help much: crypto moves together, and the panel's effecti
 
 This is why the trend overlay's alpha (t ≈ 1.9 over 5.6 years) cannot be confirmed or rejected with data that exists. Its drawdown reduction, a much larger effect, can be, and was.
 
+### 4.9 Meme coins: the trend overlay on assets it never saw
+
+From `meme_coins.json` (`quant/studies/meme_coins.py`):
+
+**The test.** The frozen trend rule was applied unchanged to every meme coin still trading on Binance: DOGE plus 21 others, listed between May 2021 (SHIB) and March 2025. None of them was used to design the rule, so this is an out-of-sample test across assets.
+
+**Costs.** The spot fee plus half a price tick per side. Sub-cent memes move in coarse steps, so their spread is at least one tick:
+- PEPE 24.5 bp, BONK 28.5 bp, SHIB 18.5 bp, measured live;
+- BTC 0.001 bp.
+
+**Survivorship.** Delisted and dead memes have no data here, so buy & hold below is far better than what meme buyers really got.
+
+**Per coin:**
+- **Buy & hold:** every one of the 22 fell 79–99% from a peak at some point, and 17 lost money per year since listing.
+- **Trend overlay drawdowns:** −20% to −61%.
+- **Sharpe:** better than buy & hold for 19 of 22, and better than the vol-targeted hold for 14 of 22.
+- **On dying coins** the overlay still lost money, just far less.
+
+**Equal-weight portfolio.** A coin enters after 365 days of history, as pre-registered.
+
+| Period | Trend overlay | Vol-targeted hold | Buy & hold |
+|---|---|---|---|
+| Full history: Sharpe / max drawdown | 0.96 / −28% | 0.57 / −59% | 0.34 / −94% |
+| Before Oct 2025: Sharpe / max drawdown | 1.11 / −26% | 0.74 / −50% | 0.49 / −93% |
+| Oct 2025 → Oct 2026: return / max drawdown | −3.6% / −16% | −17.7% / −45% | −50.6% / −74% |
+
+- **Pre-registered criterion:** the overlay criterion passes in every period.
+- **Timing alpha** versus the vol-targeted hold: +15%/yr overall (t = 2.16). By era:
+  - 2021–23: +17%/yr (t = 1.66), when the portfolio held only 1–3 coins;
+  - 2024 to September 2025: +15%/yr (t = 1.25);
+  - the last year, with 17–22 coins: +1.7%/yr (t = 0.17).
+
+  No single era is significant on its own.
+
+Conclusion: on meme coins, as on large coins, the overlay reliably limits losses but has no established alpha.
+
+**A tick-size artifact in direction prediction.** The classroom model looks 55–58% "accurate" on PEPE 1h candles, against about 52% on BTC. This is not skill:
+- most PEPE hourly candles close flat or down, because the price bounces between ticks;
+- "always DOWN" scores 56.6%, so the edge check returns NO EDGE;
+- after the half-tick cost, the strategy loses money at every confidence threshold.
+
+Accuracy on coarse-tick coins measures the tick grid, not the market.
+
 ## 5. The engine
 
 `quant/engine.py`, served at `/api/engine` and shown on the dashboard.
@@ -265,7 +311,7 @@ This is why the trend overlay's alpha (t ≈ 1.9 over 5.6 years) cannot be confi
 
   | Specialist | Status | Role |
   |---|---|---|
-  | `daily_trend` | RISK_OVERLAY | Exposure guide only, never a trade |
+  | `daily_trend` | RISK_OVERLAY | Exposure guide only, never a trade. Applied only to the 37 coins it was tested on (16 large, 21 meme) |
   | `alt_capitulation_reversal_1h` | NOT_VALIDATED | Detects events live; never trades |
   | `daily_panel_3d` | NOT_VALIDATED | Calibrated directional view |
   | `eth_4h_flow_model` | NOT_VALIDATED | Calibrated directional view |

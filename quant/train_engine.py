@@ -116,10 +116,47 @@ def trend_evidence() -> Evidence:
         f"Research period: Sharpe {rs['sharpe']:.2f} vs {rv['sharpe']:.2f}, drawdown {rs['max_dd']:.0%} vs {rv['max_dd']:.0%}, "
         f"timing alpha {a_res['alpha_ann']:+.1%}/yr (t={a_res['alpha_t']:.2f}, not significant)."
     )
+    notes = [f"holdout alpha vs vol-target {a_hold['alpha_ann']:+.1%}/yr (t={a_hold['alpha_t']:.2f})",
+             f"criteria: overlay={overlay_ok}, alpha={alpha_ok} (pre-registered)"]
+    universe = list(syms)
+    memes = _meme_evidence()
+    if memes:
+        universe += [s for s in memes["symbols"] if s not in universe]
+        notes.append(memes["note"])
     ev = Evidence(status=status, summary=summary, period=f"holdout {HOLDOUT_START} onward", sharpe=hs["sharpe"],
                   max_drawdown=hs["max_dd"], benchmark="volatility-targeted buy & hold (spot costs)",
-                  notes=[f"holdout alpha vs vol-target {a_hold['alpha_ann']:+.1%}/yr (t={a_hold['alpha_t']:.2f})",
-                         f"criteria: overlay={overlay_ok}, alpha={alpha_ok} (pre-registered)"])
+                  notes=notes, universe=universe)
+    return ev
+
+
+def _meme_evidence() -> dict | None:
+    """Out-of-sample test of the frozen trend rule on meme coins (quant/studies/meme_coins.py), if run.
+
+    Coins enter the tested universe only if the study evaluated them, and only if the
+    equal-weight meme portfolio passed the pre-registered overlay criterion.
+    """
+    from .experiment import RESULTS_DIR
+
+    path = RESULTS_DIR / "meme_coins.json"
+    if not path.exists():
+        return None
+    d = json.loads(path.read_text())
+    port = d["portfolio"]["min_history_365d"]
+    if not port["full"]["overlay_criterion"]["passed"]:
+        return None
+    full, last = port["full"], port["holdout_period"]
+    note = (f"also tested out-of-sample on {len(d['symbols'])} meme coins (survivors only): equal-weight max drawdown "
+            f"{full['trend']['max_dd']:.0%} vs {full['voltarget']['max_dd']:.0%} vol-targeted and "
+            f"{full['bh']['max_dd']:.0%} buy & hold; from {HOLDOUT_START}: {last['trend']['cagr']:+.1%}/yr vs "
+            f"{last['bh']['cagr']:+.1%}/yr buy & hold")
+    tested = [r["symbol"] for r in d["per_coin"] if "skipped" not in r]
+    return {"symbols": tested, "note": note}
+
+
+def write_trend_evidence() -> Evidence:
+    ENGINE_DIR.mkdir(parents=True, exist_ok=True)
+    ev = trend_evidence()
+    (ENGINE_DIR / "trend_evidence.json").write_text(json.dumps(asdict(ev), indent=2, default=str))
     return ev
 
 
@@ -323,9 +360,7 @@ INFORMATIONAL: list[dict] = [
 
 
 def main():
-    ENGINE_DIR.mkdir(parents=True, exist_ok=True)
-    ev = trend_evidence()
-    (ENGINE_DIR / "trend_evidence.json").write_text(json.dumps(asdict(ev), indent=2, default=str))
+    ev = write_trend_evidence()
     print("trend:", ev.status, "|", ev.summary, flush=True)
     for c in CANDIDATES:
         res = evaluate_candidate(c)

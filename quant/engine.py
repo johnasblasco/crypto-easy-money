@@ -158,6 +158,9 @@ class ModelSpecialist:
         from .experiment import ex_ante_sigma
         from .backtest import expected_edge
 
+        if symbol not in self.a.get("symbols", [symbol]):
+            return Signal(symbol, self.name, "NO TRADE", self.horizon, str(now), evidence=asdict(self.evidence),
+                          reasons=["outside this specialist's tested universe"])
         if "fng" in self.a["families"]:
             self.refresh_fng()
 
@@ -315,6 +318,9 @@ class Engine:
                     book = {"ok": False, "problems": [f"order book unavailable: {exc}"]}
             regime = regime_snapshot(m1)
             for spec in self.specialists:
+                universe = getattr(spec, "a", {}).get("symbols")
+                if universe is not None and sym not in universe:
+                    continue                       # never applied outside the universe it was tested on
                 if isinstance(spec, ModelSpecialist):
                     sig = spec.evaluate(sym, m1, now, others=closes)
                 else:

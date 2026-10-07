@@ -230,3 +230,11 @@ def test_model_signal_outside_entry_window_is_no_trade(m1):
     sig = spec.evaluate("BTCUSDT", m1, m1.index[-1] + pd.Timedelta(minutes=30))
     assert sig.action == "NO TRADE" and sig.view == "UP"
     assert any("entry window has passed" in r for r in sig.reasons)
+
+
+def test_model_specialist_refuses_symbols_outside_its_universe(m1):
+    a = artifact(p=0.9)
+    a["symbols"] = ["ETHUSDT"]
+    assert ModelSpecialist(a).evaluate("BTCUSDT", m1, now_of(m1)).action == "NO TRADE"
+    eng = Engine(["BTCUSDT"], [ModelSpecialist(a)], store=FakeStore({"BTCUSDT": m1}), use_book=False)
+    assert eng.run(now=now_of(m1), sync=False) == []

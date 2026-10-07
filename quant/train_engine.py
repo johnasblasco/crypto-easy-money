@@ -303,7 +303,17 @@ def evaluate_event_candidate(c: dict) -> dict:
 
 
 # Models shown for information only (research verdict: statistically skilful, not cost-surviving).
-INFORMATIONAL: list[dict] = []
+INFORMATIONAL: list[dict] = [
+    {
+        "name": "btc_4h_flow_view", "horizon_min": 240, "symbols": ["BTCUSDT"], "model": "lightgbm",
+        "families": ["mom", "vol", "act", "flow", "shape", "range", "regime", "cal", "ta", "xa"],
+        "cost": "perp_taker", "decision": "ev",
+        "research_summary": "Same model family as eth_4h_flow_model, fitted for BTC. Research walk-forward "
+                            "(2021-2025-09): AUC 0.562, skill over the base rate in about half the folds, but "
+                            "after perp taker costs +6.7bp/trade with p=0.28 (EV rule). Not a holdout candidate "
+                            "(one variant per idea). Shown as a calibrated directional view; it never trades.",
+    },
+]
 
 
 def main():

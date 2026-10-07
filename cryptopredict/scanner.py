@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import time
 from pathlib import Path
@@ -147,7 +148,7 @@ def format_table(rows: list[dict]) -> str:
             continue
         lines.append(
             f"{r['status']:<14} {r['symbol']:<10} {r['interval']:<6} {r['hold']:<10} {r['direction']:<5} "
-            f"{r['confidence']:>6.1%} {r['price']:>14,.4f}  {r['verdict']}"
+            f"{r['confidence']:>6.1%} {format_price(r['price']):>14}  {r['verdict']}"
         )
     buys = [r for r in rows if r["status"] == "BUY"]
     validated = {(r["symbol"], r["interval"], r["horizon"]) for r in rows if r["verdict"] == VALIDATED}
@@ -165,13 +166,21 @@ def format_table(rows: list[dict]) -> str:
 def alert_text(row: dict) -> str:
     exit_at = pd.Timestamp(row["exit_time"]).strftime("%Y-%m-%d %H:%M UTC")
     return (
-        f"BUY {row['symbol']} @ {row['price']:,.4f}\n"
+        f"BUY {row['symbol']} @ {format_price(row['price'])}\n"
         f"Hold {row['hold']} (until {exit_at}), {row['interval']} candles\n"
         f"Confidence {row['confidence']:.1%} (threshold {row['threshold']:.0%})\n"
         f"Back-test on unseen data: strategy {row['test_strategy_return']:+.1%} "
         f"vs buy & hold {row['test_buy_and_hold_return']:+.1%}\n"
         f"Not financial advice. Past results don't guarantee future ones."
     )
+
+
+def format_price(p: float) -> str:
+    """About 5 significant digits, so sub-cent meme coins (PEPE ~ $0.000004) stay readable."""
+    if not math.isfinite(p) or p <= 0:
+        return str(p)
+    digits = 2 if p >= 1000 else 4 if p >= 1 else min(12, max(4, math.ceil(-math.log10(p)) + 4))
+    return f"{p:,.{digits}f}"
 
 
 def send_alert(text: str, timeout: float = 10.0) -> list[str]:

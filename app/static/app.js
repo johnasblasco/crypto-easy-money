@@ -9,7 +9,13 @@
   const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
   const fmtPct = (v, digits = 1) => (v == null || Number.isNaN(v) ? "—" : `${(v * 100).toFixed(digits)}%`);
   const fmtSignedPct = (v) => (v == null ? "—" : `${v >= 0 ? "+" : ""}${(v * 100).toFixed(2)}%`);
-  const priceDigits = (p) => (p >= 1000 ? 2 : p >= 1 ? 4 : 6);
+  // About 5 significant digits, so sub-cent meme coins (PEPE ~ $0.000004) stay readable.
+  const priceDigits = (p) => {
+    if (!Number.isFinite(p) || p <= 0) return 2;
+    if (p >= 1000) return 2;
+    if (p >= 1) return 4;
+    return Math.min(12, Math.max(4, Math.ceil(-Math.log10(p)) + 4));
+  };
   const fmtPrice = (p) =>
     p == null ? "—" : p.toLocaleString(undefined, { minimumFractionDigits: priceDigits(p), maximumFractionDigits: priceDigits(p) });
   const fmtNum = (v) => (v == null ? "—" : Math.abs(v) >= 100 ? v.toFixed(1) : v.toFixed(2));
@@ -112,33 +118,68 @@
       `<span>RSI <b>${fmtNum(c.rsi)}</b></span>`;
   }
 
+  // A guess only counts as a call when the model is at least as confident as the threshold it chose on
+  // training data. Weaker guesses (e.g. 51% UP) are shown as gray dots: they are coin flips, not calls.
+  const isCall = (h, threshold) => Math.max(h.prob_up, 1 - h.prob_up) >= threshold;
+
   function buildMarkers(data) {
     const times = new Set(data.candles.map((c) => c.time));
     const up = css("--up");
     const down = css("--down");
+    const gray = css("--text-muted");
+    const p = data.prediction;
+    const threshold = p.threshold ?? 0.5;
     const markers = data.history
       .filter((h) => times.has(h.time))
       .slice(-MAX_MARKERS)
-      .map((h) => ({
-        time: h.time,
-        position: h.prediction ? "belowBar" : "aboveBar",
-        shape: h.prediction ? "arrowUp" : "arrowDown",
-        color: h.prediction ? up : down,
-        text: h.actual == null ? "" : h.actual === h.prediction ? "✓" : "✗",
-      }));
+      .map((h) =>
+        isCall(h, threshold)
+          ? {
+              time: h.time,
+              position: h.prediction ? "belowBar" : "aboveBar",
+              shape: h.prediction ? "arrowUp" : "arrowDown",
+              color: h.prediction ? up : down,
+              text: h.actual == null ? "" : h.actual === h.prediction ? "✓" : "✗",
+            }
+          : { time: h.time, position: h.prediction ? "belowBar" : "aboveBar", shape: "circle", color: gray, size: 0.5 }
+      );
 
-    // The live call for the candle that hasn't happened yet.
+    // The candle that hasn't happened yet: an arrow only for a validated, confident call.
     const last = data.candles[data.candles.length - 1];
-    const p = data.prediction;
-    const live = {
-      time: last.time,
-      position: p.direction === "UP" ? "belowBar" : "aboveBar",
-      shape: p.direction === "UP" ? "arrowUp" : "arrowDown",
-      color: p.direction === "UP" ? up : down,
-      text: `next ${p.direction} ${fmtPct(p.confidence, 0)}`,
-      size: 2,
-    };
+    const call = p.edge_verdict === "POSSIBLE EDGE" && p.actionable;
+    const live = call
+      ? {
+          time: last.time,
+          position: p.direction === "UP" ? "belowBar" : "aboveBar",
+          shape: p.direction === "UP" ? "arrowUp" : "arrowDown",
+          color: p.direction === "UP" ? up : down,
+          text: `next ${p.direction} ${fmtPct(p.confidence, 0)}`,
+          size: 2,
+        }
+      : {
+          time: last.time,
+          position: p.direction === "UP" ? "belowBar" : "aboveBar",
+          shape: "circle",
+          color: gray,
+          text: "no call",
+          size: 1,
+        };
     return markers.filter((m) => m.time !== last.time).concat(live);
+  }
+
+  function markerScore(data) {
+    const threshold = data.prediction.threshold ?? 0.5;
+    const scored = data.history.filter((h) => h.actual != null);
+    if (!scored.length) return "";
+    const calls = scored.filter((h) => isCall(h, threshold));
+    const right = calls.filter((h) => h.prediction === h.actual).length;
+    // Compare with the better constant guess: if 58% of candles closed down, "always DOWN" is right 58% of the time.
+    const upShare = scored.filter((h) => h.actual === 1).length / scored.length;
+    const constant = upShare >= 0.5 ? `"always UP" ${fmtPct(upShare, 0)}` : `"always DOWN" ${fmtPct(1 - upShare, 0)}`;
+    const callsText = calls.length
+      ? `${right}/${calls.length} confident calls right (${fmtPct(right / calls.length, 0)})`
+      : "no confident calls";
+    return `Unseen candles: ${callsText} · coin flip 50% · ${constant}. A model is only useful if it beats the constant guess.`;
   }
 
   function renderCharts(data, keepRange) {
@@ -146,6 +187,11 @@
     const up = css("--up");
     const down = css("--down");
 
+    // The chart's default price step is 0.01, which flattens sub-cent coins; match the coin's magnitude.
+    const last = data.candles.length ? data.candles[data.candles.length - 1].close : 1;
+    const digits = priceDigits(last);
+    const priceFormat = { type: "price", precision: digits, minMove: Math.pow(10, -digits) };
+    [charts.candles, charts.ema12, charts.ema26].forEach((s) => s.applyOptions({ priceFormat }));
     charts.candles.setData(data.candles.map(({ time, open, high, low, close }) => ({ time, open, high, low, close })));
     charts.ema12.setData(data.candles.filter((c) => c.ema12 != null).map((c) => ({ time: c.time, value: c.ema12 })));
     charts.ema26.setData(data.candles.filter((c) => c.ema26 != null).map((c) => ({ time: c.time, value: c.ema26 })));
@@ -154,6 +200,7 @@
     );
     charts.rsiLine.setData(data.candles.filter((c) => c.rsi != null).map((c) => ({ time: c.time, value: c.rsi })));
     charts.candles.setMarkers($("show-markers").checked ? buildMarkers(data) : []);
+    $("marker-score").textContent = markerScore(data);
 
     if (range) {
       charts.instances.price.timeScale().setVisibleLogicalRange(range);
@@ -201,8 +248,12 @@
     $("prob-up").textContent = fmtPct(p.prob_up);
     $("model").textContent = p.model;
     $("as-of").textContent = fmtTime(p.as_of);
+    const scored = data.history.filter((h) => h.actual != null);
+    const upShare = scored.length ? scored.filter((h) => h.actual === 1).length / scored.length : null;
     $("hit-rate").textContent =
-      data.history_count > 0 ? `${fmtPct(data.history_accuracy)} of ${data.history_count}` : "—";
+      data.history_count > 0
+        ? `${fmtPct(data.history_accuracy)} of ${data.history_count} (constant guess ${fmtPct(Math.max(upShare, 1 - upShare))})`
+        : "—";
     document.title = `${isUp ? "▲" : "▼"} ${p.symbol} ${fmtPrice(p.price)} · Crypto Direction Predictor`;
 
     $("indicators").innerHTML = p.indicators
@@ -235,7 +286,9 @@
       `Test set is ${fmtPct(m.test_up_share)} UP candles, so that's what "always UP" would score. ` +
       `p vs baseline below 0.05 means the model beat the best baseline or constant guess (${fmtPct(m.best_baseline_accuracy)}) ` +
       `by more than luck would explain. ` +
-      `Strategy = long-only, hold ${m.horizon} candle(s) when the model says UP, ${(m.fee * 100).toFixed(2)}% fee per trade.`;
+      `Strategy = long-only, hold ${m.horizon} candle(s) when the model says UP, ` +
+      `${((m.cost_per_trade ?? m.fee) * 100).toFixed(2)}% cost per trade` +
+      (m.spread ? ` (${(m.fee * 100).toFixed(2)}% fee + ${(m.spread * 100).toFixed(3)}% half-tick spread).` : ".");
     renderEdge(m.edge, m);
   }
 

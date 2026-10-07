@@ -48,6 +48,23 @@ def _klines_to_frame(rows: list) -> pd.DataFrame:
     return df
 
 
+def tick_size(symbol: str, timeout: float = 10.0) -> float | None:
+    """Binance's price step for ``symbol`` (None if unavailable).
+
+    The bid-ask spread can never be smaller than one tick. For sub-cent meme
+    coins (PEPE, SHIB, BONK) one tick is 0.1-0.3% of the price, so it matters.
+    """
+    for host in BINANCE_HOSTS:
+        try:
+            r = requests.get(f"{host}/api/v3/exchangeInfo", params={"symbol": symbol}, timeout=timeout)
+            r.raise_for_status()
+            filters = r.json()["symbols"][0]["filters"]
+            return float(next(f["tickSize"] for f in filters if f["filterType"] == "PRICE_FILTER"))
+        except Exception:
+            continue
+    return None
+
+
 def fetch_binance(
     symbol: str = "BTCUSDT",
     interval: str = "1h",

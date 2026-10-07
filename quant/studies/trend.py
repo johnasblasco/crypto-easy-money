@@ -111,7 +111,7 @@ def alpha_vs(r: pd.Series, bench: pd.Series) -> dict:
 def run_symbol(symbol: str, cost_name: str = "spot_taker", end: str = HOLDOUT_START, n_null: int = 500, seed: int = 0):
     d = daily_bars(symbol)
     d = d[d.index < pd.Timestamp(end, tz="UTC")]
-    cost = COST_MODELS[cost_name]
+    cost = COST_MODELS[cost_name] if isinstance(cost_name, str) else cost_name
     S = ensemble(d["close"])
     sig = ewma_vol(d["close"])
     size = (TARGET_VOL / sig).clip(upper=1.0)
@@ -123,7 +123,7 @@ def run_symbol(symbol: str, cost_name: str = "spot_taker", end: str = HOLDOUT_ST
     r_vt = backtest_weights(size, d, symbol, cost)
 
     out = {
-        "symbol": symbol, "cost": cost_name,
+        "symbol": symbol, "cost": getattr(cost, "name", str(cost_name)),
         "period": [str(d.index[0].date()), str(d.index[-1].date())],
         "time_in_market": float((S > 0).mean()), "avg_weight": float((S * size).mean()),
         "trend": stats(r_trend), "buy_hold": stats(r_bh), "voltarget_hold": stats(r_vt),

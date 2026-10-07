@@ -28,7 +28,7 @@ from sklearn.inspection import permutation_importance
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
 from sklearn.model_selection import TimeSeriesSplit
 
-from .data import load_data
+from .data import tick_size, load_data
 from .features import FEATURE_COLUMNS, build_dataset
 from .models import get_models
 
@@ -193,6 +193,14 @@ def run(
     random_state: int = 42,
     verbose: bool = True,
 ) -> dict:
+    # Crossing the spread costs at least half a price tick per side. Negligible for BTC,
+    # but 0.1-0.15% per side for sub-cent meme coins, on top of the exchange fee.
+    spread = 0.0
+    if source == "binance":
+        tick = tick_size(symbol)
+        if tick:
+            spread = 0.5 * tick / float(df["close"].median())
+    cost = fee + spread
     X, y, frame = build_dataset(df, horizon)
     if len(X) < 300:
         raise ValueError(f"Only {len(X)} usable rows; load more candles (at least ~500).")
@@ -219,14 +227,14 @@ def run(
         "model": f"Baseline: always {'UP' if majority else 'DOWN'}",
         "baseline": True,
         **classification_metrics(y_test, base_pred, np.full(len(y_test), y_train.mean())),
-        **backtest(base_pred, future_ret, fee, horizon),
+        **backtest(base_pred, future_ret, cost, horizon),
     })
     persist_pred = (X_test["ret_1"] > 0).astype(int).to_numpy()
     results.append({
         "model": "Baseline: repeat last move",
         "baseline": True,
         **classification_metrics(y_test, persist_pred, persist_pred),
-        **backtest(persist_pred, future_ret, fee, horizon),
+        **backtest(persist_pred, future_ret, cost, horizon),
     })
 
     fitted, test_probs, oof = {}, {}, {}
@@ -243,7 +251,7 @@ def run(
             "baseline": False,
             **cv,
             **classification_metrics(y_test, pred, prob),
-            **backtest(pred, future_ret, fee, horizon),
+            **backtest(pred, future_ret, cost, horizon),
         })
 
     candidates = [r for r in results if not r["baseline"]]
@@ -268,9 +276,9 @@ def run(
     # only, then applied unchanged to the test period.
     oof_prob, oof_idx = oof[best_name]
     train_future = frame["future_return"].iloc[:train_end].to_numpy()
-    cv_thresholds = threshold_analysis(oof_prob, y_train.to_numpy()[oof_idx], train_future[oof_idx], fee, horizon)
+    cv_thresholds = threshold_analysis(oof_prob, y_train.to_numpy()[oof_idx], train_future[oof_idx], cost, horizon)
     threshold = choose_threshold(cv_thresholds)
-    test_thresholds = threshold_analysis(test_probs[best_name], y_test_arr, future_ret, fee, horizon)
+    test_thresholds = threshold_analysis(test_probs[best_name], y_test_arr, future_ret, cost, horizon)
     at_threshold = next(r for r in test_thresholds if r["threshold"] == threshold)
     edge = edge_verdict(best, at_threshold)
     edge.update(threshold=threshold, cv_thresholds=cv_thresholds, test_thresholds=test_thresholds)
@@ -296,6 +304,8 @@ def run(
         "horizon": horizon,
         "trained_at": trained_at,
         "fee": fee,
+        "spread": spread,
+        "cost_per_trade": cost,
         "rows": {"total": len(X), "train": len(X_train), "test": len(X_test)},
         "test_period": [str(test_frame["timestamp"].iloc[0]), str(test_frame["timestamp"].iloc[-1])],
         "test_up_share": float(y_test.mean()),
@@ -369,7 +379,9 @@ def format_report(metrics: dict) -> str:
     lines += [
         "",
         f"Strategy = long-only, hold {metrics['horizon']} candle(s) when the model predicts UP, "
-        f"{metrics['fee'] * 100:.2f}% fee per trade, no slippage. p vs baseline = one-sided binomial test "
+        f"{metrics.get('cost_per_trade', metrics['fee']) * 100:.2f}% cost per trade "
+        f"({metrics['fee'] * 100:.2f}% fee + {metrics.get('spread', 0) * 100:.3f}% half-tick spread), no other slippage. "
+        f"p vs baseline = one-sided binomial test "
         f"against the best baseline or best constant guess ({_pct(metrics['best_baseline_accuracy'])}).",
         "",
         f"## Confidence threshold ({metrics['best_model']}, test period)",

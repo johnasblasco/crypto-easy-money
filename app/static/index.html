@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Crypto Direction Predictor</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><path d='M8 2l6 11H2z' fill='%230ca30c'/></svg>">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <h1 id="pair">—</h1>
+      <span class="badge" id="interval">—</span>
+      <span class="badge" id="source">—</span>
+    </div>
+    <div class="price-block">
+      <span class="price" id="price">—</span>
+      <span class="delta" id="change">—</span>
+    </div>
+  </header>
+
+  <div id="error" class="error" hidden></div>
+
+  <main class="layout">
+    <section class="card chart-card">
+      <div class="chart-head">
+        <div class="legend" id="legend" aria-live="polite"></div>
+        <label class="toggle">
+          <input type="checkbox" id="show-markers" checked>
+          Past predictions
+        </label>
+      </div>
+      <div class="key">
+        <span><i class="swatch line s1"></i>EMA 12</span>
+        <span><i class="swatch line s2"></i>EMA 26</span>
+        <span><b class="up">▲</b>/<b class="down">▼</b> model call · <b>✓</b> right · <b>✗</b> wrong</span>
+      </div>
+      <div id="price-chart" class="chart chart-price" role="img" aria-label="Candlestick price chart"></div>
+      <div class="pane-label">Volume</div>
+      <div id="volume-chart" class="chart chart-small" role="img" aria-label="Volume chart"></div>
+      <div class="pane-label">RSI (14) <span class="muted">· 70 overbought / 30 oversold</span></div>
+      <div id="rsi-chart" class="chart chart-small" role="img" aria-label="RSI chart"></div>
+    </section>
+
+    <aside class="side">
+      <section class="card prediction" id="prediction-card">
+        <div class="eyebrow">Next <span id="horizon">1</span> candle prediction</div>
+        <div class="call" id="call">—</div>
+        <div class="confidence"><span id="confidence">—</span> confidence</div>
+        <div class="meter" aria-hidden="true">
+          <div class="meter-fill" id="meter-fill"></div>
+          <div class="meter-mid"></div>
+        </div>
+        <div class="meter-scale"><span>DOWN</span><span>50%</span><span>UP</span></div>
+        <dl class="meta">
+          <dt>P(UP)</dt><dd id="prob-up">—</dd>
+          <dt>Model</dt><dd id="model">—</dd>
+          <dt>As of</dt><dd id="as-of">—</dd>
+          <dt>Recent hit rate</dt><dd id="hit-rate">—</dd>
+        </dl>
+      </section>
+
+      <section class="card">
+        <h2>Indicators</h2>
+        <table class="indicators">
+          <tbody id="indicators"></tbody>
+        </table>
+      </section>
+    </aside>
+
+    <section class="card wide">
+      <h2>Model comparison <span class="muted" id="test-period"></span></h2>
+      <div class="table-scroll">
+        <table class="models">
+          <thead>
+            <tr>
+              <th>Model</th><th>CV acc</th><th>Accuracy</th><th>Precision</th>
+              <th>Recall</th><th>F1</th><th>ROC AUC</th><th>Strategy</th><th>Buy &amp; hold</th>
+            </tr>
+          </thead>
+          <tbody id="models"></tbody>
+        </table>
+      </div>
+      <p class="note" id="models-note"></p>
+    </section>
+  </main>
+
+  <footer class="footer">
+    Academic project — direction classification from historical data. Not financial advice;
+    crypto markets are noisy and accuracy near 50% is the norm.
+  </footer>
+
+  <script src="/static/vendor/lightweight-charts.standalone.production.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

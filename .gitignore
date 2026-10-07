@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Downloaded candles and trained models are reproducible; regenerate them.
+data/*
+!data/.gitkeep
+models/*
+!models/.gitkeep

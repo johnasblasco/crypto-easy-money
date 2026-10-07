@@ -31,6 +31,10 @@ def frame() -> pd.DataFrame:
     days = pd.date_range(max(u.index[0], b.index[0]).ceil("D") + pd.Timedelta(days=3), end, freq="1D", tz="UTC")
     lu = np.log(u["close"]).ffill()
     lb = fill_prices(b).ffill()
+    # USDCUSDT was halted for months (2022-09 -> 2023-03): a forward-filled price there is
+    # not a premium. Keep only days whose previous 24h actually traded.
+    traded = (~u["gap"]).rolling(1440, min_periods=1).mean().reindex(days).to_numpy() > 0.5
+    days = days[traded]
     df = pd.DataFrame(index=days)
     df["prem_bps"] = lu.reindex(days).to_numpy() * 1e4
     df["dprem_bps"] = df["prem_bps"] - lu.reindex(days - pd.Timedelta("1D")).to_numpy() * 1e4

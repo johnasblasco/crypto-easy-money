@@ -27,7 +27,7 @@ What the data *does* support:
 
 Every "edge" the search produced at first glance fell apart under adversarial testing:
 - **Market beta:** the daily ML panel's +316 bp per trade.
-- **One episode:** the stablecoin premium's t = −3.4 came from the March 2023 USDC de-peg.
+- **Data artifacts and one episode:** the stablecoin premium's t = −3.4 came from prices carried through a five-month trading halt and from the March 2023 USDC de-peg.
 - **Selection from many trials:** the capitulation reversal had a deflated Sharpe of 0.07 over 252 cells.
 
 The machinery that caught them is reusable, and it is the most valuable part of this project.
@@ -85,7 +85,7 @@ The working assumption was that the obvious answers are probably wrong, such as 
 | Cross-sectional momentum | Not significant (p 0.27–0.58); long-short loses | — |
 | Daily ML panel | 3-day LightGBM +316 bp/trade, p = 0.007 (mostly market timing) | Abstained. Forced trading: −249 bp/trade |
 | Quarter-hour opening imbalance | Weak continuation (t ≈ 2 at 4h); fails Holm; tiny effect | — |
-| Stablecoin premium → BTC | t = −3.4, but driven entirely by the March 2023 USDC de-peg | — |
+| Stablecoin premium → BTC | t = −3.4 at first; a trading-halt artifact plus the March 2023 USDC de-peg (t = −1.1 on real trading days) | — |
 | Regime specialists / regime calibration | Worse than one global model (DM p ≈ 1) | — |
 
 ### 4.2 Short-horizon direction: real information, no profit
@@ -212,7 +212,7 @@ The dissection found what that result really is:
 - **Few independent bets:** 42 decision dates, about 15 coins each, mostly all in the same direction.
 - **Mostly beta:** 176 of the 188 bp gross per row is the equal-weight market's own move in that direction. The excess is 12 bp, t = 1.29.
 - **Concentrated:** it traded in only 3 of 17 folds, and its top 5 dates supply 74% of the gross.
-- **Timing:** its dates beat random dates (p = 0.023). It is a market-timing call on 42 decisions.
+- **Timing:** its trades beat the market on random dates (p = 0.023; about 0.04 when counting market timing alone, without coin selection). It is a market-timing call on 42 decisions.
 - **Spot version:** without shorting, the long-only version shows nothing (date-level t = 0.45).
 
 Holdout: the frozen model's skill gate failed, so it never traded. Post-hoc forced trading would have lost −249 bp/trade (Sharpe −0.71).
@@ -241,13 +241,13 @@ These come from `flow_regressions.json` and `stablecoin_robust.json`.
 - **Against:** 3 of 12 regressions have |t| > 2, but none survive Holm across the 12. The effect is about 0.02σ of the forward return.
 - **Verdict:** weak, economically negligible support.
 
-**Stablecoin premium.** The USDC/USDT log price at 00:00 predicts the next day's BTC return, t = −3.38 with HAC errors. Every robustness check knocks it down:
-- excluding the March 2023 USDC de-peg (23 of 2,093 days): t = −0.73;
-- winsorising the premium: t = −1.03;
-- by year: 2023 alone gives t = −7.2, and 2025 flips sign;
-- a tradeable version adds nothing beyond its exposure (t = 0.54).
+**Stablecoin premium.** The first run showed the USDC/USDT log price at 00:00 predicting the next day's BTC return, t = −3.38 with HAC errors. Adversarial checks took it apart:
+- **A data artifact:** USDC/USDT did not trade on Binance from September 2022 to March 2023. The first run carried the last price through those 167 days as if it were a real premium. On the 1,926 days with real trading, t = −1.15.
+- **One episode:** excluding the March 2023 de-peg as well gives t = −0.73; winsorising the premium gives t = −1.20. 2023 alone has t = −3.05, and 2025 flips sign.
+- **The daily *change* in the premium** looks significant (t = 2.8), but falls to t = 1.3 without the de-peg window.
+- **Tradeable version:** a rule built on the premium adds nothing beyond its exposure (t = 0.38), and its Sharpe (0.54) is below buy & hold's (0.72) on the same days.
 
-Rejected as a single-episode artifact.
+Rejected: a data artifact plus a single episode.
 
 ### 4.8 Statistical power: why "maybe" is the honest answer for small edges
 
@@ -285,10 +285,13 @@ This is why the trend overlay's alpha (t ≈ 1.9 over 5.6 years) cannot be confi
   - otherwise the validated signal, or NO TRADE.
 
   Directional views from all specialists are summarised as agree or conflict, as context only (§4.6).
-- **Degradation.** Each specialist runs a one-sided CUSUM on its live trade results:
-  - the threshold is calibrated to an in-control average run length of 3,000 trades;
-  - a rolling 50-trade upper-confidence-bound check runs alongside;
-  - an alarm switches the specialist to NO TRADE until it is revalidated.
+- **Degradation.** Every actionable signal is paper-traded (`quant/paper.py`):
+  1. it is recorded once;
+  2. after its horizon it is resolved with the research fill model and costs;
+  3. the net result feeds that specialist's monitor: a one-sided CUSUM (in-control average run length 3,000 trades) plus a rolling 50-trade upper-confidence-bound check;
+  4. an alarm switches the specialist to NO TRADE.
+
+  The monitor state is saved, so a restart does not re-enable it. Only a new validation, with new evidence, starts a fresh monitor.
 - **Speed.** The first call seeds 400 days of 1-minute bars per coin from disk and syncs the gap from Binance (about 100 s for 16 coins). Later calls fetch only new bars, and results are cached for 5 minutes.
 
 ## 6. What this means for using it
@@ -329,3 +332,8 @@ This is why the trend overlay's alpha (t ≈ 1.9 over 5.6 years) cannot be confi
 | Live signals had no entry window | A 3-day decision could be shown as actionable two days late |
 | Experiment runner forked worker processes from a multithreaded parent | Intermittent deadlock (`tests/test_edge.py` hung); now uses spawn |
 | Fear & Greed array read-only under pandas 3 | Daily ML study crashed |
+| Holdout criteria counted held rows as trades and left out exit costs | Would have biased a verdict toward VALIDATED (no effect here: the model candidates made 0 trades) |
+| A lagging decision bar let the previous decision pass the entry window | A 4-hour or 3-day-old decision shown as fresh |
+| Degradation monitor existed but nothing fed it live results | Auto-disable could never fire; now fed by the paper-trade ledger |
+| USDC/USDT forward-filled through a five-month trading halt | Manufactured most of the stablecoin "signal" |
+| One failing specialist raised an error for the whole engine | Every coin blank; now isolated per specialist |

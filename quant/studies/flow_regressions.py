@@ -65,6 +65,8 @@ def stablecoin_premium():
     end = pd.Timestamp(HOLDOUT_START, tz="UTC") - pd.Timedelta(days=4)
     days = pd.date_range(max(u.index[0], b.index[0]).ceil("D") + pd.Timedelta(days=3), end, freq="1D", tz="UTC")
     lu = np.log(u["close"]).ffill()
+    # Skip days when USDCUSDT was not trading (a months-long halt would otherwise be filled).
+    days = days[(~u["gap"]).rolling(1440, min_periods=1).mean().reindex(days).to_numpy() > 0.5]
     prem = lu.reindex(days).to_numpy()
     dprem = prem - lu.reindex(days - pd.Timedelta("1D")).to_numpy()
     uq = u["quote_volume"].rolling(1440, min_periods=1200).sum()

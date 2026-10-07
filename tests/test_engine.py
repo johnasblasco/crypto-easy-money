@@ -238,3 +238,68 @@ def test_model_specialist_refuses_symbols_outside_its_universe(m1):
     assert ModelSpecialist(a).evaluate("BTCUSDT", m1, now_of(m1)).action == "NO TRADE"
     eng = Engine(["BTCUSDT"], [ModelSpecialist(a)], store=FakeStore({"BTCUSDT": m1}), use_book=False)
     assert eng.run(now=now_of(m1), sync=False) == []
+
+
+def test_model_waits_for_the_decision_bar(m1):
+    """A bar lagging the decision time must not turn the previous decision into a fresh one."""
+    spec = ModelSpecialist(artifact(p=0.9))
+    lagging = m1.iloc[:-1]                       # last bar is 1 minute before the hour
+    sig = spec.evaluate("BTCUSDT", lagging, m1.index[-1] + pd.Timedelta(seconds=30))
+    assert sig.action == "NO TRADE"
+    assert pd.Timestamp(sig.as_of) == m1.index[-1] - pd.Timedelta(hours=1)
+
+
+# ---------------------------------------------------------------- paper ledger -> health monitor
+
+def test_paper_trade_resolves_like_research_labels(tmp_path, m1):
+    from quant.costs import PERP
+    from quant.labels import fill_prices
+    from quant.paper import PaperLedger
+
+    spec = ModelSpecialist(artifact(p=0.9))
+    led = PaperLedger(tmp_path / "t.jsonl", tmp_path / "h.json")
+    t0 = m1.index[-200]
+    sig = {"symbol": "BTCUSDT", "specialist": spec.name, "action": "LONG", "as_of": t0.isoformat()}
+    assert led.record(sig, 60, "perp_taker") and not led.record(sig, 60, "perp_taker")   # recorded once
+    assert led.resolve({"BTCUSDT": m1}, [spec]) == 1
+    lf = fill_prices(m1)
+    entry, exit_ = t0 + pd.Timedelta(minutes=1), t0 + pd.Timedelta(minutes=61)
+    expected = lf[exit_] - lf[entry] - PERP.round_trip("BTCUSDT") - PERP.holding(60, 1)
+    assert led.trades[0]["net"] == pytest.approx(expected)
+    assert spec.health.n == 1
+
+
+def test_health_state_persists_and_resets_on_revalidation(tmp_path):
+    from quant.paper import PaperLedger
+
+    spec = ModelSpecialist(artifact(p=0.9))
+    for _ in range(200):
+        spec.health.update(-0.05)
+    assert not spec.health.active
+    led = PaperLedger(tmp_path / "t.jsonl", tmp_path / "h.json")
+    led.save_health([spec])
+    again = ModelSpecialist(artifact(p=0.9))
+    PaperLedger(tmp_path / "t.jsonl", tmp_path / "h.json").load_health([again])
+    assert not again.health.active                      # a restart does not re-enable it
+    a = artifact(p=0.9)
+    a["evidence"]["summary"] = "fresh validation"
+    fresh = ModelSpecialist(a)
+    PaperLedger(tmp_path / "t.jsonl", tmp_path / "h.json").load_health([fresh])
+    assert fresh.health.active                          # new evidence -> fresh monitor
+
+
+def test_engine_records_validated_trades_only(tmp_path, m1):
+    from quant.paper import PaperLedger
+
+    led = PaperLedger(tmp_path / "t.jsonl", tmp_path / "h.json")
+    specs = [ModelSpecialist(artifact(p=0.9)), ModelSpecialist({**artifact(status="NOT_VALIDATED", p=0.9), "name": "info"})]
+    eng = Engine(["BTCUSDT"], specs, store=FakeStore({"BTCUSDT": m1}), use_book=False, paper=led)
+    eng.run(now=now_of(m1), sync=False)
+    eng.run(now=now_of(m1), sync=False)
+    assert [t["specialist"] for t in led.trades] == ["test_model"]
+
+
+def test_unvalidated_trend_rule_never_suggests_exposure_as_action(m1):
+    ev = Evidence(status="NOT_VALIDATED", summary="x")
+    sig = TrendSpecialist(ev, fetch_daily=False).evaluate("BTCUSDT", synthetic_m1(days=260, seed=2), now_of(m1))
+    assert sig.action in ("NO TRADE", "FLAT")

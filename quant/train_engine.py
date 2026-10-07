@@ -26,7 +26,7 @@ from . import metrics as M
 from . import models
 from .backtest import (Calibrator, Dataset, choose_ev_margin, choose_threshold, has_skill, portfolio_returns,
                        positions_from_ev, positions_from_prob, round_trips, simulate_panel, split_validation,
-                       trading_stats)
+                       trades, trading_stats)
 from .costs import COST_MODELS
 from .data import KLINE_DIR, UNIVERSE
 from .engine import ENGINE_DIR, Evidence
@@ -194,9 +194,9 @@ def evaluate_candidate(c: dict) -> dict:
     pred = _predict_positions(ds, art, rows, cost, c["decision"])
     sim = simulate_panel(pred, cost, ds.horizon_min)
     st = trading_stats(sim, ds.horizon_min)
-    act = sim[sim["pos"] != 0]
-    ev_day = pd.DataFrame({"ts": act.index, "net": act["net"].to_numpy()})
-    mean, p_day, lo = day_bootstrap(ev_day, "net") if len(ev_day) >= 5 else (float("nan"),) * 3
+    # Trade-level P&L (each trade includes its exit cost), clustered by entry day.
+    act = trades(sim)
+    mean, p_day, lo = day_bootstrap(act, "net") if len(act) >= 5 else (float("nan"),) * 3
     # Deflated Sharpe over every research-period trial of this study in the ledger (pre-registered).
     trials = [t for t in ledger.trials() if t["config"].get("study") == c["study"]]
     dsr = float("nan")
@@ -227,7 +227,8 @@ def evaluate_candidate(c: dict) -> dict:
     artifact = {"name": c["name"], "horizon_min": c["horizon_min"], "families": c["families"],
                 "columns": list(ds.X.columns), "model": live["model"], "calibrator": live["calibrator"],
                 "margin": live["margin"], "cost": c["cost"], "decision": c["decision"],
-                "evidence": asdict(evidence), "trade_sigma": trade_sigma, "symbols": c["symbols"]}
+                "evidence": asdict(evidence), "trade_sigma": trade_sigma, "symbols": c["symbols"],
+                "xa_universe": PANEL_SYMBOLS}
     return {"artifact": artifact, "holdout_stats": st, "evidence": asdict(evidence)}
 
 
@@ -244,7 +245,7 @@ def informational_model(c: dict, research_summary: str) -> dict:
     return {"name": c["name"], "horizon_min": c["horizon_min"], "families": c["families"],
             "columns": list(ds.X.columns), "model": live["model"], "calibrator": live["calibrator"],
             "margin": None, "cost": c["cost"], "decision": c["decision"], "evidence": asdict(evidence),
-            "trade_sigma": 0.01, "symbols": c["symbols"]}
+            "trade_sigma": 0.01, "symbols": c["symbols"], "xa_universe": PANEL_SYMBOLS}
 
 
 # ------------------------------------------------------------------ events

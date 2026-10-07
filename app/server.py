@@ -212,7 +212,10 @@ def _get_engine():
         if not specs:
             raise HTTPException(status_code=503, detail="Signal engine not trained yet: run `python -m quant.train_engine`.")
         symbols = os.environ.get("ENGINE_SYMBOLS", ",".join(UNIVERSE)).split(",")
-        _engine_state["engine"] = Engine(symbols, specs, use_book=os.environ.get("ENGINE_BOOK", "1") == "1")
+        from quant.paper import PaperLedger
+
+        _engine_state["engine"] = Engine(symbols, specs, use_book=os.environ.get("ENGINE_BOOK", "1") == "1",
+                                         paper=PaperLedger())
     return _engine_state["engine"]
 
 
@@ -228,7 +231,8 @@ def engine_signals():
     from quant.engine import consensus
 
     payload = {"generated_at": pd.Timestamp.now(tz="UTC").isoformat(), "signals": _json_safe(signals),
-               "consensus": _json_safe(consensus(signals)), "specialists": specialists}
+               "consensus": _json_safe(consensus(signals)), "specialists": specialists,
+               "paper": eng.paper.summary() if eng.paper is not None else None}
     _engine_state.update(payload=payload, at=time.time())
     return payload
 

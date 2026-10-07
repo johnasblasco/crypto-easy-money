@@ -83,6 +83,8 @@ class TrendSpecialist:
 
     name = "daily_trend"
     horizon = "1 day (re-evaluated 00:00 UTC)"
+    horizon_min = 1440
+    cost_name = "spot_taker"
 
     def __init__(self, evidence: Evidence, target_vol: float = 0.5, fetch_daily: bool = True):
         self.evidence = evidence
@@ -116,6 +118,12 @@ class TrendSpecialist:
         action = "LONG" if exposure > 0 else "FLAT"
         comps = int(round(s * 9))
         reasons = [f"{comps}/9 trend components are long", f"annualised volatility {v:.0%} -> size cap {min(1.0, self.target_vol / v):.2f}"]
+        if self.evidence.status not in ("VALIDATED", "RISK_OVERLAY"):
+            action = "NO TRADE"
+            reasons.append("trend rule did not pass its pre-registered holdout criteria -> informational only")
+        elif not self.health.active:
+            action = "NO TRADE"
+            reasons.append(f"disabled by health monitor: {self.health.reason}")
         return Signal(symbol, self.name, action, self.horizon, str(d.index[-1]), exposure=round(exposure, 3),
                       view="UP" if s >= 0.5 else "DOWN", reasons=reasons, evidence=asdict(self.evidence), health=self.health.snapshot(),
                       next_decision=next_dec)
@@ -136,6 +144,7 @@ class ModelSpecialist:
         self.horizon = f"{self.horizon_min // 60}h" if self.horizon_min >= 60 else f"{self.horizon_min}m"
         self.evidence = Evidence(**artifact["evidence"])
         self.cost = COST_MODELS[artifact["cost"]]
+        self.cost_name = artifact["cost"]
         ev = self.evidence
         self.health = SignalHealth(self.name, mu0=(ev.ev_bps or 0) / 1e4, sigma=artifact.get("trade_sigma", 0.01))
 
@@ -166,7 +175,9 @@ class ModelSpecialist:
 
         grid = pd.Timedelta(minutes=self.horizon_min)
         t = now.floor(f"{self.horizon_min}min")
-        t = min(t, m1["close"].last_valid_index().floor("min"))
+        # If the decision bar has not arrived yet, the latest decision we can compute is the
+        # previous grid point (never an off-grid time); the entry window then blocks it.
+        t = min(t, m1["close"].last_valid_index().floor(f"{self.horizon_min}min"))
         # Compute the full trailing decision grid exactly as in training (some features,
         # e.g. the 1-year volatility percentile, are defined over the grid's history),
         # then keep the last row.
@@ -174,6 +185,17 @@ class ModelSpecialist:
         times = pd.date_range(start, t, freq=f"{self.horizon_min}min", tz="UTC")
         X = F.build(m1, times, symbol, others=others, families=self.a["families"]).iloc[[-1]]
         X = X.reindex(columns=self.a["columns"])
+        notes = []
+        if "xa" in self.a["families"]:
+            from .data import KLINE_DIR, UNIVERSE
+
+            expected = self.a.get("xa_universe") or [u for u in UNIVERSE if (KLINE_DIR / f"{u}.parquet").exists()]
+            missing_xa = [u for u in expected if u != symbol and u not in (others or {})]
+            if missing_xa:
+                X.loc[:, [c for c in X.columns if c.startswith("xa__")]] = np.nan   # incomplete market inputs
+                notes.append(f"cross-asset inputs missing for {len(missing_xa)} coin(s)")
+        if self.horizon_min > 1440 and "regime" in self.a["families"]:
+            notes.append("live approximation: the 1-year volatility percentile uses the ~400 days held live")
         sig = ex_ante_sigma(m1, times[-1:], self.horizon_min).to_numpy()[0]
         nxt = (t + grid).isoformat()
         base = dict(symbol=symbol, specialist=self.name, horizon=self.horizon, as_of=t.isoformat(),
@@ -188,8 +210,8 @@ class ModelSpecialist:
         margin = self.a.get("margin")
         direction = "LONG" if p >= 0.5 else "SHORT"
         conf = p if p >= 0.5 else 1 - p
-        reasons = [f"calibrated P(up) = {p:.3f}", f"expected move size {sig * 1e4:.0f}bp over {self.horizon}",
-                   f"expected edge {edge * 1e4:+.1f}bp vs round-trip cost {rt * 1e4:.1f}bp"]
+        reasons = notes + [f"calibrated P(up) = {p:.3f}", f"expected move size {sig * 1e4:.0f}bp over {self.horizon}",
+                           f"expected edge {edge * 1e4:+.1f}bp vs round-trip cost {rt * 1e4:.1f}bp"]
         action = "NO TRADE"
         if self.evidence.status != "VALIDATED":
             reasons.append("specialist did not pass out-of-sample validation after costs -> informational only")
@@ -234,8 +256,9 @@ class EventSpecialist:
     def __init__(self, artifact: dict):
         self.a = artifact
         self.name = artifact["name"]
-        self.h = int(artifact["h"])
+        self.h = self.horizon_min = int(artifact["h"])
         self.horizon = f"{self.h // 60}h" if self.h >= 60 else f"{self.h}m"
+        self.cost_name = artifact["cost"]
         self.evidence = Evidence(**artifact["evidence"])
         self.cost = COST_MODELS[artifact["cost"]]
         ev = self.evidence
@@ -252,9 +275,9 @@ class EventSpecialist:
         tail = m1[m1.index > m1.index[-1] - self.LOOKBACK]
         b = Bars(tail)
         sig = h_flow_driven_reversal(b, int(self.a["W"]), float(self.a["k"]))
+        kept = select(sig, cooldown=self.h)            # cooldown over both directions, as in research
         if not self.cost.allow_short:
-            sig = np.where(sig > 0, sig, 0)
-        kept = select(sig, cooldown=self.h)
+            kept = np.asarray([i for i in kept if sig[i] > 0], dtype=np.int64)
         last_t = tail.index[-1]
         recent = [i for i in kept if tail.index[i] > last_t - pd.Timedelta(minutes=self.h)]
         reasons = []
@@ -285,11 +308,14 @@ class EventSpecialist:
 # ---------------------------------------------------------------- the engine
 
 class Engine:
-    def __init__(self, symbols, specialists, store: LiveStore | None = None, use_book: bool = True):
+    def __init__(self, symbols, specialists, store: LiveStore | None = None, use_book: bool = True, paper=None):
         self.symbols = list(symbols)
         self.specialists = specialists
         self.store = store or LiveStore()
         self.use_book = use_book
+        self.paper = paper                  # quant.paper.PaperLedger: feeds realised results to each monitor
+        if paper is not None:
+            paper.load_health(specialists)
 
     def run(self, now: pd.Timestamp | None = None, sync: bool = True) -> list[dict]:
         now = now or pd.Timestamp.now(tz="UTC")
@@ -304,6 +330,8 @@ class Engine:
             except Exception as exc:  # network etc.
                 frames[sym] = exc
         closes = {s: np.log(f["close"]).ffill() for s, f in frames.items() if isinstance(f, pd.DataFrame)}
+        if self.paper is not None:          # resolve matured paper trades first, so health is current
+            self.paper.resolve({s: f for s, f in frames.items() if isinstance(f, pd.DataFrame)}, self.specialists)
         for sym in self.symbols:
             m1 = frames[sym]
             if not isinstance(m1, pd.DataFrame):
@@ -321,10 +349,14 @@ class Engine:
                 universe = getattr(spec, "a", {}).get("symbols")
                 if universe is not None and sym not in universe:
                     continue                       # never applied outside the universe it was tested on
-                if isinstance(spec, ModelSpecialist):
-                    sig = spec.evaluate(sym, m1, now, others=closes)
-                else:
-                    sig = spec.evaluate(sym, m1, now)
+                try:
+                    if isinstance(spec, ModelSpecialist):
+                        sig = spec.evaluate(sym, m1, now, others=closes)
+                    else:
+                        sig = spec.evaluate(sym, m1, now)
+                except Exception as exc:     # one broken specialist must not take the others down
+                    sig = Signal(sym, spec.name, "NO TRADE", spec.horizon, str(now),
+                                 evidence=asdict(spec.evidence), reasons=[f"specialist error: {exc}"])
                 sig.regime = regime
                 veto = None
                 if not health["ok"]:
@@ -335,6 +367,9 @@ class Engine:
                     sig.action, sig.reasons = "NO TRADE", book["problems"] + sig.reasons
                 d = sig.to_dict()
                 d["veto"] = veto
+                if (self.paper is not None and d["action"] in ("LONG", "SHORT")
+                        and spec.evidence.status == "VALIDATED"):
+                    self.paper.record(d, spec.horizon_min, spec.cost_name)
                 d["data_health"] = health
                 d["book"] = book
                 out.append(d)
@@ -385,9 +420,14 @@ def regime_snapshot(m1: pd.DataFrame) -> dict:
     """Ex-ante regime description (same definitions as the research regimes)."""
     r = np.log(m1["close"]).ffill().diff()
     rv_1d = float(np.sqrt((r.iloc[-1440:] ** 2).sum()))
-    daily = np.sqrt((r ** 2).resample("1D").sum()).dropna()
-    pct = float((daily.iloc[-366:-1] < daily.iloc[-1]).mean()) if len(daily) > 60 else None
-    ret_7d = float(np.log(m1["close"].dropna().iloc[-1] / m1["close"].dropna().iloc[-10080])) if len(m1) > 10080 else None
+    # Rolling 1440-minute windows sampled once a day, ending at the latest bar, so the
+    # current value and its reference set are all complete 24-hour windows.
+    rolling = np.sqrt((r ** 2).rolling(1440, min_periods=1300).sum())
+    ref = rolling.iloc[::-1].iloc[::1440].iloc[1:367].dropna()
+    pct = float((ref < rv_1d).mean()) if len(ref) > 60 else None
+    closes = m1["close"].dropna()
+    ret_7d = (float(np.log(closes.iloc[-1] / closes.asof(closes.index[-1] - pd.Timedelta(days=7))))
+              if len(closes) and closes.index[-1] - closes.index[0] > pd.Timedelta(days=7) else None)
     return {
         "vol_1d_pct": round(rv_1d * 100, 2),
         "vol_percentile_1y": None if pct is None else round(pct, 2),

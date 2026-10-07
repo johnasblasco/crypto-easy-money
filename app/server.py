@@ -225,8 +225,10 @@ def engine_signals():
     signals = eng.run()
     specialists = [{"name": sp.name, "horizon": sp.horizon, "evidence": _json_safe(json.loads(json.dumps(
         sp.evidence.__dict__, default=str))), "health": sp.health.snapshot()} for sp in eng.specialists]
+    from quant.engine import consensus
+
     payload = {"generated_at": pd.Timestamp.now(tz="UTC").isoformat(), "signals": _json_safe(signals),
-               "specialists": specialists}
+               "consensus": _json_safe(consensus(signals)), "specialists": specialists}
     _engine_state.update(payload=payload, at=time.time())
     return payload
 

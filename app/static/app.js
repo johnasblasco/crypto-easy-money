@@ -422,7 +422,9 @@
       })
       .join("");
     const specs = data.specialists.map((s) => s.name);
-    $("engine-head").innerHTML = `<tr><th>Token</th><th>Data</th><th>Regime</th>${specs.map((n) => `<th>${esc(n)}</th>`).join("")}</tr>`;
+    $("engine-head").innerHTML = `<tr><th>Token</th><th>Verdict</th><th>Data</th><th>Regime</th>${specs.map((n) => `<th>${esc(n)}</th>`).join("")}</tr>`;
+    const verdicts = {};
+    (data.consensus || []).forEach((c) => { verdicts[c.symbol] = c; });
     const bySym = {};
     data.signals.forEach((s) => { (bySym[s.symbol] = bySym[s.symbol] || {})[s.specialist] = s; });
     $("engine-body").innerHTML = Object.entries(bySym)
@@ -443,12 +445,22 @@
           return `<td class="cell"><span class="pill ${a.cls}">${a.label}</span> <span class="muted">${esc(detail)}</span>` +
             `<span class="why" title="${esc((s.reasons || []).join(" · "))}">${esc(why)}</span></td>`;
         });
-        return `<tr><td>${esc(sym)}</td><td>${data}</td><td>${esc(regime)}</td>${cells.join("")}</tr>`;
+        const c = verdicts[sym];
+        let verdict = "<td class='cell'>—</td>";
+        if (c) {
+          const va = ACTION[c.verdict] || ACTION["NO TRADE"];
+          const agree = c.agreement === "conflict" ? "<span class='down'>views conflict</span>"
+            : c.agreement === "agree" ? "views agree" : esc(c.agreement);
+          verdict = `<td class="cell"><span class="pill ${va.cls}">${va.label}</span> <span class="muted">${agree}</span>` +
+            `<span class="why" title="${esc(c.why)}">${esc(c.why)}</span></td>`;
+        }
+        return `<tr><td>${esc(sym)}</td>${verdict}<td>${data}</td><td>${esc(regime)}</td>${cells.join("")}</tr>`;
       })
       .join("");
-    const actionable = data.signals.filter((s) => s.action === "LONG" || s.action === "SHORT").length;
+    const actionable = (data.consensus || []).filter((c) => c.verdict === "LONG" || c.verdict === "SHORT").length;
     $("engine-note").textContent =
-      `${actionable} actionable signal(s). Hover a reason for the full explanation. ` +
+      `${actionable} actionable verdict(s). A verdict needs a validated, healthy specialist whose edge clears costs; ` +
+      "otherwise it is NO TRADE. Hover a reason for the full explanation. " +
       "Exposure = suggested fraction of capital for that coin from the daily trend overlay. Not financial advice.";
   }
 

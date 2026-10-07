@@ -57,6 +57,7 @@ class Signal:
     as_of: str
     confidence: float | None = None  # calibrated P(direction) where the specialist has one
     exposure: float | None = None    # target weight in [0, 1] for allocation specialists
+    view: str | None = None          # directional lean (UP/DOWN) whether or not it is tradeable
     expected_edge_bps: float | None = None
     cost_bps: float | None = None
     reasons: list = field(default_factory=list)
@@ -116,7 +117,7 @@ class TrendSpecialist:
         comps = int(round(s * 9))
         reasons = [f"{comps}/9 trend components are long", f"annualised volatility {v:.0%} -> size cap {min(1.0, self.target_vol / v):.2f}"]
         return Signal(symbol, self.name, action, self.horizon, str(d.index[-1]), exposure=round(exposure, 3),
-                      reasons=reasons, evidence=asdict(self.evidence), health=self.health.snapshot(),
+                      view="UP" if s >= 0.5 else "DOWN", reasons=reasons, evidence=asdict(self.evidence), health=self.health.snapshot(),
                       next_decision=next_dec)
 
 
@@ -191,7 +192,7 @@ class ModelSpecialist:
             else:
                 reasons.append(f"decision rule not met: {hurdle}")
         return Signal(action=action, confidence=round(conf, 4), expected_edge_bps=round(edge * 1e4, 2),
-                      cost_bps=round(rt * 1e4, 2), reasons=reasons, **base)
+                      cost_bps=round(rt * 1e4, 2), view="UP" if p >= 0.5 else "DOWN", reasons=reasons, **base)
 
 
 # ---------------------------------------------------------------- the engine
@@ -244,6 +245,45 @@ class Engine:
                 d["book"] = book
                 out.append(d)
         return out
+
+
+def consensus(signals: list[dict]) -> list[dict]:
+    """One verdict per symbol, reconciling the specialists.
+
+    * Insufficient information (stale or gappy data) -> NO TRADE.
+    * Only a VALIDATED, healthy specialist can produce a trade (its action is
+      already gated); a RISK_OVERLAY's exposure is allocation guidance, never a trade.
+    * Validated specialists pointing opposite ways -> NO TRADE (conflict).
+    * ``agreement`` compares the directional views of every specialist, tradeable
+      or not, so the user sees when the evidence lines up and when it does not.
+    """
+    by_sym: dict[str, list[dict]] = {}
+    for s in signals:
+        by_sym.setdefault(s["symbol"], []).append(s)
+    out = []
+    for sym, sigs in by_sym.items():
+        health = next((s.get("data_health") for s in sigs if s.get("data_health")), None) or {}
+        trades = [s for s in sigs if s["action"] in ("LONG", "SHORT")
+                  and s.get("evidence", {}).get("status") == "VALIDATED"]
+        views = {s["specialist"]: s.get("view") for s in sigs if s.get("view")}
+        ups, downs = sum(v == "UP" for v in views.values()), sum(v == "DOWN" for v in views.values())
+        agreement = ("no views" if not views else "single view" if len(views) == 1
+                     else "agree" if ups == 0 or downs == 0 else "conflict")
+        overlay = next((s for s in sigs if s.get("exposure") is not None), None)
+        if not health.get("ok", False):
+            verdict, why = "NO TRADE", "insufficient information: " + "; ".join(health.get("problems", ["data unavailable"]))
+        elif {s["action"] for s in trades} == {"LONG", "SHORT"}:
+            verdict, why = "NO TRADE", "validated specialists conflict"
+        elif trades:
+            best = max(trades, key=lambda s: s.get("expected_edge_bps") or 0)
+            verdict = best["action"]
+            why = f"{best['specialist']} ({best['horizon']}): edge {best.get('expected_edge_bps')}bp vs cost {best.get('cost_bps')}bp"
+        else:
+            verdict, why = "NO TRADE", "no validated edge clears costs right now"
+        out.append({"symbol": sym, "verdict": verdict, "why": why, "agreement": agreement, "views": views,
+                    "exposure": None if overlay is None else overlay.get("exposure"),
+                    "regime": sigs[0].get("regime", {})})
+    return out
 
 
 def regime_snapshot(m1: pd.DataFrame) -> dict:

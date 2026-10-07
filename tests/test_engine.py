@@ -4,7 +4,7 @@ import pandas as pd
 import pytest
 
 from quant.backtest import Calibrator
-from quant.engine import Engine, Evidence, ModelSpecialist, TrendSpecialist, regime_snapshot
+from quant.engine import Engine, Evidence, ModelSpecialist, TrendSpecialist, consensus, regime_snapshot
 from quant.live import data_health
 
 from test_quant_harness import synthetic_m1
@@ -141,3 +141,31 @@ def test_trend_specialist_outputs_exposure(m1):
 def test_regime_snapshot_keys(m1):
     r = regime_snapshot(m1)
     assert {"vol_regime", "trend_7d", "vol_1d_pct"} <= set(r)
+
+
+def _sig(spec, action, view, status="VALIDATED", ok=True, edge=10.0, exposure=None):
+    return {"symbol": "BTCUSDT", "specialist": spec, "action": action, "view": view, "horizon": "4h",
+            "evidence": {"status": status}, "expected_edge_bps": edge, "cost_bps": 12.0, "exposure": exposure,
+            "data_health": {"ok": ok, "problems": [] if ok else ["data is 600s old"]}, "regime": {}}
+
+
+def test_consensus_requires_validated_trade():
+    c = consensus([_sig("model", "NO TRADE", "UP", status="NOT_VALIDATED"),
+                   _sig("daily_trend", "LONG", "UP", status="RISK_OVERLAY", exposure=0.6)])[0]
+    assert c["verdict"] == "NO TRADE"          # an overlay's LONG is allocation, not a trade
+    assert c["agreement"] == "agree" and c["exposure"] == 0.6
+
+
+def test_consensus_conflicting_validated_specialists_is_no_trade():
+    c = consensus([_sig("a", "LONG", "UP"), _sig("b", "SHORT", "DOWN")])[0]
+    assert c["verdict"] == "NO TRADE" and "conflict" in c["why"] and c["agreement"] == "conflict"
+
+
+def test_consensus_insufficient_data_is_no_trade():
+    c = consensus([_sig("a", "LONG", "UP", ok=False)])[0]
+    assert c["verdict"] == "NO TRADE" and c["why"].startswith("insufficient information")
+
+
+def test_consensus_passes_through_validated_trade():
+    c = consensus([_sig("a", "LONG", "UP"), _sig("daily_trend", "FLAT", "DOWN", status="RISK_OVERLAY", exposure=0.0)])[0]
+    assert c["verdict"] == "LONG" and c["agreement"] == "conflict"

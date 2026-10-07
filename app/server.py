@@ -197,6 +197,40 @@ def scanner():
     return _cached(("scanner", str(summary)), summary, SCAN_CACHE_SECONDS, build)
 
 
+# ------------------------------------------------------------ signal engine
+
+ENGINE_TTL_SECONDS = int(os.environ.get("ENGINE_TTL", 300))
+_engine_state: dict = {"engine": None, "at": 0.0, "payload": None}
+
+
+def _get_engine():
+    from quant.data import UNIVERSE
+    from quant.engine import Engine, load_specialists
+
+    if _engine_state["engine"] is None:
+        specs = load_specialists()
+        if not specs:
+            raise HTTPException(status_code=503, detail="Signal engine not trained yet: run `python -m quant.train_engine`.")
+        symbols = os.environ.get("ENGINE_SYMBOLS", ",".join(UNIVERSE)).split(",")
+        _engine_state["engine"] = Engine(symbols, specs, use_book=os.environ.get("ENGINE_BOOK", "1") == "1")
+    return _engine_state["engine"]
+
+
+@app.get("/api/engine")
+def engine_signals():
+    """Evidence-gated signals for every symbol and specialist (NO TRADE unless justified)."""
+    if _engine_state["payload"] is not None and time.time() - _engine_state["at"] < ENGINE_TTL_SECONDS:
+        return _engine_state["payload"]
+    eng = _get_engine()
+    signals = eng.run()
+    specialists = [{"name": sp.name, "horizon": sp.horizon, "evidence": _json_safe(json.loads(json.dumps(
+        sp.evidence.__dict__, default=str))), "health": sp.health.snapshot()} for sp in eng.specialists]
+    payload = {"generated_at": pd.Timestamp.now(tz="UTC").isoformat(), "signals": _json_safe(signals),
+               "specialists": specialists}
+    _engine_state.update(payload=payload, at=time.time())
+    return payload
+
+
 @app.get("/")
 def index():
     return FileResponse(STATIC_DIR / "index.html")

@@ -282,3 +282,53 @@ def test_monitor_quiet_when_healthy_and_trips_when_edge_disappears():
     assert not mon.active
     mon.revalidate(mu0, sd)
     assert mon.active
+
+
+def test_btc_keeps_cross_asset_columns(m1):
+    """Regression: pooled panels used to drop every BTC row because BTC lacked xa__btc_* columns."""
+    times = decision_times(m1, "60min")
+    other = synthetic_m1(seed=9)
+    closes = {"BTCUSDT": np.log(m1["close"]).ffill(), "ETHUSDT": np.log(other["close"]).ffill()}
+    xb = F.build(m1, times, "BTCUSDT", others=closes, families=["xa"])
+    xe = F.build(other, times, "ETHUSDT", others=closes, families=["xa"])
+    assert set(xb.columns) == set(xe.columns)
+    assert any(c.startswith("xa__btc_") for c in xb.columns)
+
+
+def test_skill_gate_rejects_noise_models():
+    """Regression: calibrating and judging skill on the same slice made the gate always pass."""
+    rng = np.random.default_rng(11)
+    times = pd.date_range("2021-01-01", periods=24 * 700, freq="1h", tz="UTC")
+    X = pd.DataFrame(rng.normal(size=(len(times), 8)), index=times, columns=[f"f{i}" for i in range(8)])
+    r = pd.Series(rng.normal(0, 0.005, len(times)), index=times)
+    ds = Dataset("BTCUSDT", 60, X, r, pd.Series(times + pd.Timedelta("61min"), index=times))
+    folds = walk_forward(ds.times, pd.DatetimeIndex(ds.label_end), test_size="90D", min_train="365D")
+    from quant.models import lightgbm
+    pred = walk_forward_predict(ds, folds, lightgbm(n_estimators=100, min_child_samples=50), cost=PERP)
+    assert pred.groupby("fold")["skilled"].first().mean() < 0.5
+
+
+def test_clustered_se_wider_for_duplicated_timestamps():
+    from quant.backtest import _ev_and_se
+
+    rng = np.random.default_rng(0)
+    base = rng.normal(0, 0.01, 200)
+    net = np.repeat(base, 5)               # 5 identical rows per timestamp (perfectly correlated coins)
+    groups = np.repeat(np.arange(200), 5)
+    _, se_naive = _ev_and_se(net, None)
+    _, se_cluster = _ev_and_se(net, groups)
+    assert se_cluster > 1.8 * se_naive
+
+
+def test_trend_daily_bars_keep_partial_outage_days():
+    from quant.studies import trend as T
+
+    idx = pd.date_range("2024-01-01 00:01", periods=3 * 1440, freq="1min", tz="UTC")
+    m1 = synthetic_m1(days=3)
+    m1.loc[m1.index[1440:1440 + 400], ["open", "high", "low", "close"]] = np.nan   # 400-minute outage on day 2
+    m1.loc[m1.index[1440:1440 + 400], "gap"] = True
+    d = resample(m1, "1D")
+    full = d.reindex(pd.date_range(d.index[0], d.index[-1], freq="1D", tz="UTC"))
+    full.loc[full["gap_frac"] >= 0.999, "close"] = np.nan
+    outage_day = full[(full["gap_frac"] > 0.2) & (full["gap_frac"] < 0.4)]
+    assert len(outage_day) == 1 and outage_day["close"].notna().all()

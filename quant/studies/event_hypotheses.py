@@ -138,7 +138,8 @@ def market_arrays(symbols, ref_index, W: int = 60) -> dict:
         rets.append((lc - lc.shift(W)).to_numpy())
     R = np.vstack(rets)
     with np.errstate(invalid="ignore"):
-        return {"mkt": np.nanmean(R, axis=0), "breadth_up": np.nanmean(R > 0, axis=0),
+        up = np.where(np.isfinite(R), (R > 0).astype(float), np.nan)
+        return {"mkt": np.nanmean(R, axis=0), "breadth_up": np.nanmean(up, axis=0),
                 "count": np.sum(np.isfinite(R), axis=0)}
 
 

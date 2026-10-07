@@ -31,6 +31,23 @@
       </div>
     </section>
 
+    <section class="card wide" id="engine-card">
+      <div class="scanner-head">
+        <h2>Signal engine <span class="muted" id="engine-time"></span></h2>
+        <span class="badge" id="engine-badge">evidence-gated</span>
+      </div>
+      <p class="note engine-intro">Each specialist only signals when its edge survived out-of-sample testing after costs,
+        its live health monitor is green, and the data and order book check out. Otherwise: <b>NO TRADE</b>, with the reason.</p>
+      <div class="specialists" id="specialists"></div>
+      <div class="table-scroll">
+        <table class="models engine-table">
+          <thead id="engine-head"></thead>
+          <tbody id="engine-body"></tbody>
+        </table>
+      </div>
+      <p class="note" id="engine-note"></p>
+    </section>
+
     <section class="card wide" id="scanner-card">
       <div class="scanner-head">
         <h2>Market scanner <span class="muted" id="scan-time"></span></h2>

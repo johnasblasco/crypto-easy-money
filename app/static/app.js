@@ -400,8 +400,73 @@
     if (lastData) renderCharts(lastData, false);
   });
 
+  // ------------------------------------------------------------ signal engine
+  const ACTION = {
+    LONG: { cls: "buy", label: "▲ LONG" },
+    SHORT: { cls: "avoid", label: "▼ SHORT" },
+    FLAT: { cls: "flat", label: "— FLAT" },
+    "NO TRADE": { cls: "notrade", label: "NO TRADE" },
+  };
+  const esc = (t) => String(t).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+  function renderEngine(data) {
+    $("engine-time").textContent = `· ${fmtTime(data.generated_at)}`;
+    $("specialists").innerHTML = data.specialists
+      .map((sp) => {
+        const st = sp.evidence.status;
+        const cls = st === "VALIDATED" ? "validated" : st === "RISK_OVERLAY" ? "overlay" : "not";
+        const label = { VALIDATED: "✓ validated", RISK_OVERLAY: "! risk overlay (not alpha)", NOT_VALIDATED: "✗ not validated" }[st] || st;
+        const health = sp.health.state === "ACTIVE" ? "health: active" : `health: ${sp.health.state} — ${sp.health.reason}`;
+        return `<div class="spec"><h3>${esc(sp.name)} <span class="muted">· ${esc(sp.horizon)}</span></h3>` +
+          `<div class="status ${cls}">${label}</div><p>${esc(sp.evidence.summary)}</p><p class="muted">${esc(health)}</p></div>`;
+      })
+      .join("");
+    const specs = data.specialists.map((s) => s.name);
+    $("engine-head").innerHTML = `<tr><th>Token</th><th>Data</th><th>Regime</th>${specs.map((n) => `<th>${esc(n)}</th>`).join("")}</tr>`;
+    const bySym = {};
+    data.signals.forEach((s) => { (bySym[s.symbol] = bySym[s.symbol] || {})[s.specialist] = s; });
+    $("engine-body").innerHTML = Object.entries(bySym)
+      .map(([sym, sigs]) => {
+        const any = Object.values(sigs)[0];
+        const dh = any.data_health || {};
+        const data = dh.ok ? `ok · ${Math.round(dh.staleness_s || 0)}s` : `<span class="down">${esc((dh.problems || ["?"])[0])}</span>`;
+        const rg = any.regime || {};
+        const regime = rg.vol_regime ? `${rg.vol_regime} vol · 7d ${rg.trend_7d}` : "—";
+        const cells = specs.map((n) => {
+          const s = sigs[n];
+          if (!s) return "<td class='cell'>—</td>";
+          const a = ACTION[s.action] || ACTION["NO TRADE"];
+          let detail = "";
+          if (s.exposure != null) detail = `exposure ${(s.exposure * 100).toFixed(0)}%`;
+          if (s.expected_edge_bps != null) detail = `edge ${s.expected_edge_bps.toFixed(1)}bp vs cost ${s.cost_bps.toFixed(1)}bp · P ${(s.confidence * 100).toFixed(1)}%`;
+          const why = (s.reasons || []).slice(-1)[0] || "";
+          return `<td class="cell"><span class="pill ${a.cls}">${a.label}</span> <span class="muted">${esc(detail)}</span>` +
+            `<span class="why" title="${esc((s.reasons || []).join(" · "))}">${esc(why)}</span></td>`;
+        });
+        return `<tr><td>${esc(sym)}</td><td>${data}</td><td>${esc(regime)}</td>${cells.join("")}</tr>`;
+      })
+      .join("");
+    const actionable = data.signals.filter((s) => s.action === "LONG" || s.action === "SHORT").length;
+    $("engine-note").textContent =
+      `${actionable} actionable signal(s). Hover a reason for the full explanation. ` +
+      "Exposure = suggested fraction of capital for that coin from the daily trend overlay. Not financial advice.";
+  }
+
+  async function loadEngine() {
+    try {
+      const res = await fetch("/api/engine");
+      const body = await res.json();
+      if (!res.ok) throw new Error(body.detail || res.statusText);
+      renderEngine(body);
+    } catch (err) {
+      $("engine-note").textContent = `Signal engine unavailable: ${err.message}`;
+    }
+  }
+
   createCharts();
   load(false);
+  loadEngine();
+  setInterval(loadEngine, 5 * REFRESH_MS);
   loadScanner();
   setInterval(() => load(true), REFRESH_MS);
   setInterval(loadScanner, 2 * REFRESH_MS);

@@ -90,8 +90,10 @@ def main(horizon_days: int = 1, cost_names=("spot_taker", "perp_taker")):
         preds["trend"] = base.assign(pos=np.where(s_vals >= 0.5, 1, 0))
         preds["bh"] = base.assign(pos=1)
         # Meta-labeling: trained only on trend-long rows; long only if the trend is long AND the model agrees.
+        import dataclasses
+        long_only = dataclasses.replace(cost, allow_short=False)   # meta rule only ever goes long
         meta = walk_forward_predict(meta_panel, meta_folds, models.lightgbm(n_estimators=200, min_child_samples=100),
-                                    cost=COST_MODELS["spot_taker"] if not cost.allow_short else cost)
+                                    cost=long_only)
         mkey = pd.MultiIndex.from_arrays([meta.index, meta["sym"]])
         mpos = pd.Series(np.clip(meta["pos"].to_numpy(), 0, 1), index=mkey)
         preds["trend_meta"] = base.assign(pos=mpos.reindex(pd.MultiIndex.from_arrays([base.index, base["sym"]])).fillna(0).astype(int).to_numpy())

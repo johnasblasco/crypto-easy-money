@@ -18,7 +18,28 @@ from quant.labels import fill_prices
 from quant.studies import trend as T
 
 
+_BARS: dict = {}
+
+
+def prepare(symbols, variants=((0, 1),)) -> None:
+    """Precompute daily bars for every (offset_h, delay_min) variant, loading each coin's 1m data once."""
+    import quant.experiment as E
+
+    for sym in symbols:
+        todo = [v for v in variants if (sym, *v) not in _BARS]
+        for off, delay in todo:
+            _BARS[(sym, off, delay)] = _daily_bars_offset(sym, off, delay)
+        E._M1_CACHE.pop(sym, None)
+
+
 def daily_bars_offset(symbol: str, offset_h: int = 0, delay_min: int = 1) -> pd.DataFrame:
+    key = (symbol, offset_h, delay_min)
+    if key not in _BARS:
+        _BARS[key] = _daily_bars_offset(symbol, offset_h, delay_min)
+    return _BARS[key]
+
+
+def _daily_bars_offset(symbol: str, offset_h: int = 0, delay_min: int = 1) -> pd.DataFrame:
     """Daily bars whose boundary is offset_h UTC; fill delay_min after the boundary."""
     m1 = m1_frame(symbol)
     rule = "1D"
@@ -28,7 +49,7 @@ def daily_bars_offset(symbol: str, offset_h: int = 0, delay_min: int = 1) -> pd.
     d.index = d.index + pd.Timedelta(hours=offset_h)
     full = pd.date_range(d.index[0], d.index[-1], freq="1D", tz="UTC")
     d = d.reindex(full)
-    d.loc[d["gap_frac"] >= 0.05, ["open", "high", "low", "close"]] = np.nan
+    d.loc[d["gap_frac"] >= 0.999, ["open", "high", "low", "close"]] = np.nan
     lp = fill_prices(m1, "vwap")
     d["fill"] = lp.reindex(d.index + pd.Timedelta(minutes=delay_min)).to_numpy()
     return d
@@ -75,9 +96,16 @@ def summary(port: dict) -> dict:
     return out
 
 
-def main():
+def main(only: list[str] | None = None):
+    import sys
+
+    only = only or sys.argv[1:] or None
     syms = [s for s in UNIVERSE if (KLINE_DIR / f"{s}.parquet").exists()]
+    prepare(syms, ((0, 1), (8, 1), (16, 1), (0, 60), (0, 240), (0, 720)))
     results = {"symbols": syms}
+
+    def wanted(name):
+        return only is None or name in only
 
     def show(name, res):
         t, v, b, a = res["trend"], res["voltarget"], res["bh"], res["alpha_vs_voltarget"]
@@ -87,8 +115,10 @@ def main():
         results[name] = res
 
     base = portfolio(syms)
-    show("portfolio_all", summary(base))
-    show("portfolio_btc_eth", summary(portfolio(["BTCUSDT", "ETHUSDT"])))
+    if wanted("portfolio_all"):
+        show("portfolio_all", summary(base))
+    if wanted("portfolio_btc_eth"):
+        show("portfolio_btc_eth", summary(portfolio(["BTCUSDT", "ETHUSDT"])))
     by_year = {}
     for y in sorted(set(base["trend"].index.year)):
         m = {k: v[v.index.year == y] for k, v in base.items()}
@@ -105,16 +135,20 @@ def main():
         "target_vol_0.3": {"target_vol": 0.3},
         "target_vol_0.8": {"target_vol": 0.8},
     }.items():
-        show(name, summary(portfolio(syms, **kw)))
+        if wanted(name):
+            show(name, summary(portfolio(syms, **kw)))
     # Timing: day boundary and execution delay
     for off in (8, 16):
-        show(f"day_boundary_{off:02d}utc", summary(portfolio(syms, offset_h=off)))
+        if wanted(f"day_boundary_{off:02d}utc"):
+            show(f"day_boundary_{off:02d}utc", summary(portfolio(syms, offset_h=off)))
     for delay in (60, 240, 720):
-        show(f"exec_delay_{delay}min", summary(portfolio(syms, delay_min=delay)))
+        if wanted(f"exec_delay_{delay}min"):
+            show(f"exec_delay_{delay}min", summary(portfolio(syms, delay_min=delay)))
     # Costs
     double = CostModel("spot_2x", fee_bps=20.0, other_impact_bps=6.0, impact_bps={"BTCUSDT": 2.0, "ETHUSDT": 2.0})
-    show("cost_2x", summary(portfolio(syms, cost_name=double)))
-    save("trend_robustness", results)
+    if wanted("cost_2x"):
+        show("cost_2x", summary(portfolio(syms, cost_name=double)))
+    save("trend_robustness" if only is None else "trend_robustness_part2", results)
 
 
 if __name__ == "__main__":

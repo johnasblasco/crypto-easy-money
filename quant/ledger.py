@@ -67,9 +67,27 @@ def returns_matrix(ids: list[str], ledger_dir: Path = LEDGER_DIR) -> pd.DataFram
     return pd.DataFrame(cols).fillna(0.0)
 
 
+def _horizon(cfg: dict):
+    return cfg.get("h", cfg.get("horizon"))
+
+
 def selection_stats(match: dict, candidate: str, ledger_dir: Path = LEDGER_DIR) -> dict:
-    """DSR of ``candidate`` given all trials whose config matches ``match``, and their PBO."""
-    rows = [t for t in trials(ledger_dir) if all(t["config"].get(k) == v for k, v in match.items())]
+    """DSR of ``candidate`` against every recorded trial matching ``match``, and their PBO.
+
+    ``match`` may contain ``h`` (horizon, matched whether the trial stored it as
+    ``h`` or ``horizon``); every other key must match exactly. Pass an empty
+    dict to deflate against ALL trials ever run (most conservative).
+    """
+    def ok(cfg):
+        for k, v in match.items():
+            if k == "h":
+                if _horizon(cfg) != v:
+                    return False
+            elif cfg.get(k) != v:
+                return False
+        return True
+
+    rows = [t for t in trials(ledger_dir) if ok(t["config"])]
     ids = [t["id"] for t in rows]
     if candidate not in ids:
         raise KeyError(candidate)

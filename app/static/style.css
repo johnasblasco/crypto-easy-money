@@ -225,6 +225,20 @@ td { font-variant-numeric: tabular-nums; }
 .pill.avoid { color: var(--down-text); }
 .pill.wait { color: var(--text-secondary); }
 .pill.none { color: var(--text-muted); font-weight: 500; border-style: dashed; }
+.engine-intro { margin: 0 0 12px; }
+.specialists { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; margin-bottom: 12px; }
+.spec { border: 1px solid var(--border); border-radius: 10px; padding: 12px; }
+.spec h3 { margin: 0 0 4px; font-size: 14px; }
+.spec .status { font-size: 12px; font-weight: 600; }
+.spec .status.validated { color: var(--up-text); }
+.spec .status.overlay { color: var(--warning-text); }
+.spec .status.not { color: var(--down-text); }
+.spec p { margin: 6px 0 0; font-size: 12px; color: var(--text-secondary); }
+.engine-table td { vertical-align: top; }
+.engine-table td.cell { text-align: left; white-space: normal; min-width: 170px; }
+.engine-table .why { display: block; font-size: 11px; color: var(--text-secondary); margin-top: 3px; }
+.pill.flat { color: var(--text-secondary); }
+.pill.notrade { color: var(--text-muted); border-style: dashed; }
 .footer { text-align: center; font-size: 12px; color: var(--text-muted); padding: 8px 16px 24px; }
 
 @media (max-width: 900px) {

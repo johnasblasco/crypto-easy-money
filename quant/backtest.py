@@ -128,6 +128,22 @@ def positions_from_prob(p, margin: float, allow_short: bool) -> np.ndarray:
     return pos.astype(int)
 
 
+def _ev_and_se(net: np.ndarray, groups: np.ndarray | None) -> tuple[float, float]:
+    """Mean and standard error of net returns; rows sharing a timestamp (panel) form one cluster."""
+    if groups is None:
+        return float(net.mean()), float(net.std(ddof=1) / np.sqrt(len(net)))
+    g = pd.Series(net).groupby(np.asarray(groups)).agg(["sum", "count"])
+    per = g["sum"].to_numpy() / g["count"].to_numpy()
+    k = len(per)
+    if k < 2:
+        return float(net.mean()), float("inf")
+    # Ratio estimator of the row mean with cluster-robust SE.
+    mean = float(g["sum"].sum() / g["count"].sum())
+    resid = g["sum"].to_numpy() - mean * g["count"].to_numpy()
+    se = float(np.sqrt(k / (k - 1) * np.sum(resid ** 2)) / g["count"].sum())
+    return mean, se
+
+
 def round_trips(symbols, cost: CostModel, horizon_min: int) -> np.ndarray:
     symbols = np.atleast_1d(np.asarray(symbols, dtype=object))
     table = {s: cost.round_trip(s) + cost.holding(horizon_min) for s in set(symbols)}
@@ -153,7 +169,7 @@ def positions_from_ev(p, sigma, rt, margin: float, allow_short: bool) -> np.ndar
 
 
 def choose_ev_margin(p_valid, sigma_valid, r_valid, symbol, cost: CostModel, horizon_min: int,
-                     min_trades: int = 30, z: float = 1.0) -> tuple[float | None, dict]:
+                     min_trades: int = 30, z: float = 1.0, groups=None) -> tuple[float | None, dict]:
     """Like choose_threshold but the rule is 'expected edge > cost + margin'."""
     p_valid, sigma_valid, r_valid = (np.asarray(a, float) for a in (p_valid, sigma_valid, r_valid))
     rt = round_trips(symbol if np.ndim(symbol) else [symbol] * len(p_valid), cost, horizon_min)
@@ -166,7 +182,7 @@ def choose_ev_margin(p_valid, sigma_valid, r_valid, symbol, cost: CostModel, hor
             table[float(m)] = {"n": n}
             continue
         net = pos[active] * r_valid[active] - rt[active]
-        ev, se = float(net.mean()), float(net.std(ddof=1) / np.sqrt(n))
+        ev, se = _ev_and_se(net, None if groups is None else np.asarray(groups)[active])
         table[float(m)] = {"n": n, "ev": ev, "lcb": ev - z * se}
         if ev - z * se > 0 and (ev - z * se) * n > best_lcb:
             best, best_lcb = float(m), (ev - z * se) * n
@@ -181,7 +197,7 @@ def has_skill(p_valid, y_valid, base_rate: float, min_gain: float = 0.0) -> bool
 
 
 def choose_threshold(p_valid, r_valid, symbol, cost: CostModel, horizon_min: int,
-                     min_trades: int = 30, z: float = 1.0) -> tuple[float | None, dict]:
+                     min_trades: int = 30, z: float = 1.0, groups=None) -> tuple[float | None, dict]:
     """Pick the margin maximising the lower confidence bound of total net EV on validation.
 
     Each validation trade is charged a full round trip (conservative: validation
@@ -200,8 +216,7 @@ def choose_threshold(p_valid, r_valid, symbol, cost: CostModel, horizon_min: int
             table[float(m)] = {"n": n, "ev": float("nan"), "lcb": float("nan")}
             continue
         net = pos[active] * r_valid[active] - rt[active]
-        ev = float(net.mean())
-        se = float(net.std(ddof=1) / np.sqrt(n))
+        ev, se = _ev_and_se(net, None if groups is None else np.asarray(groups)[active])
         lcb_total = (ev - z * se) * n  # total edge, lower bound
         table[float(m)] = {"n": n, "ev": ev, "lcb": ev - z * se}
         if ev - z * se > 0 and lcb_total > best_lcb:
@@ -210,6 +225,13 @@ def choose_threshold(p_valid, r_valid, symbol, cost: CostModel, horizon_min: int
 
 
 # ------------------------------------------------------------ walk-forward
+
+def split_validation(times: pd.DatetimeIndex, valid: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Chronological halves of the validation slice: (calibration rows, selection rows)."""
+    vt = times[valid]
+    mid = vt[0] + (vt[-1] - vt[0]) / 2
+    return valid[vt < mid], valid[vt >= mid]
+
 
 def walk_forward_predict(ds: Dataset, folds: list[Fold], model_factory, calibration: str = "platt",
                          decide: bool = True, cost: CostModel | None = None,
@@ -232,17 +254,23 @@ def walk_forward_predict(ds: Dataset, folds: list[Fold], model_factory, calibrat
             continue
         model = model_factory()
         model.fit(X[fit], y[fit])
-        cal = Calibrator(calibration).fit(model.predict_proba(X[valid])[:, 1], y[valid])
-        p_valid = cal.transform(model.predict_proba(X[valid])[:, 1])
+        # Calibrate on the first half of the validation slice (A); judge skill and pick the
+        # NO-TRADE margin on the second half (B) with A's calibration -> both are out-of-sample.
+        cal_rows, sel_rows = split_validation(ds.times, valid)
+        cal = Calibrator(calibration).fit(model.predict_proba(X[cal_rows])[:, 1], y[cal_rows])
+        p_sel = cal.transform(model.predict_proba(X[sel_rows])[:, 1])
         p_test_raw = model.predict_proba(X[test])[:, 1]
         p_test = cal.transform(p_test_raw)
         margin = None
-        skilled = has_skill(p_valid, y[valid], float(np.mean(y[fit]))) if skill_gate else True
+        skilled = has_skill(p_sel, y[sel_rows], float(np.mean(y[fit]))) if skill_gate else True
+        groups = ds.times[sel_rows].asi8
         if decide and cost is not None and skilled:
             if decision == "ev":
-                margin, _ = choose_ev_margin(p_valid, sig[valid], r[valid], ds.sym[valid], cost, ds.horizon_min, min_trades)
+                margin, _ = choose_ev_margin(p_sel, sig[sel_rows], r[sel_rows], ds.sym[sel_rows], cost, ds.horizon_min,
+                                             min_trades, groups=groups)
             else:
-                margin, _ = choose_threshold(p_valid, r[valid], ds.sym[valid], cost, ds.horizon_min, min_trades)
+                margin, _ = choose_threshold(p_sel, r[sel_rows], ds.sym[sel_rows], cost, ds.horizon_min, min_trades,
+                                             groups=groups)
         if margin is None:
             pos = np.zeros(len(test), dtype=int)
         elif decision == "ev":

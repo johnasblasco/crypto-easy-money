@@ -274,12 +274,17 @@ def cross_asset(g: Grid, symbol: str, others: dict[str, pd.Series], windows=(15,
         frame = pd.DataFrame(cols, index=t)
         rets[L] = frame
         own = g.logret(L)
-        out[f"xa__breadth_{L}"] = (frame > 0).mean(axis=1).to_numpy()
+        # breadth over coins that actually have data (unlisted/missing coins are not 'down')
+        out[f"xa__breadth_{L}"] = frame.gt(0).where(frame.notna()).mean(axis=1).to_numpy()
         out[f"xa__mkt_{L}"] = frame.mean(axis=1).to_numpy()
         out[f"xa__dispersion_{L}"] = frame.std(axis=1).to_numpy()
         out[f"xa__rel_{L}"] = own - frame.mean(axis=1).to_numpy()
-        if symbol != "BTCUSDT" and "BTCUSDT" in frame:
+        # BTC's return is defined for every symbol (for BTC itself it is its own return), so
+        # the column set is identical across coins and pooled panels keep every row.
+        if "BTCUSDT" in frame:
             out[f"xa__btc_{L}"] = frame["BTCUSDT"].to_numpy()
+        elif symbol == "BTCUSDT":
+            out[f"xa__btc_{L}"] = own
     # Residual vs market with a trailing 30-day beta from hourly returns (past only).
     return out
 
@@ -364,7 +369,7 @@ def fear_greed(g: Grid) -> dict:
     # stale if the last available value is more than 3 days old
     last = frame.index[np.maximum(frame.index.searchsorted(g.times, side="right") - 1, 0)]
     stale = (g.times - last) > pd.Timedelta("3D")
-    out = {c: aligned[c].to_numpy(float) for c in frame.columns}
+    out = {c: np.array(aligned[c].to_numpy(float), copy=True) for c in frame.columns}
     for c in out:
         out[c][stale] = np.nan
     return out

@@ -26,11 +26,16 @@ RESULTS_DIR = ROOT / "data" / "results"
 HOLDOUT_START = "2025-10-01"
 
 _M1_CACHE: dict = {}
+M1_CACHE_MAX = 3  # full 1m frames are ~300-450MB each; keep only the most recently used
 
 
 def m1_frame(symbol: str) -> pd.DataFrame:
-    if symbol not in _M1_CACHE:
-        _M1_CACHE[symbol] = load(symbol)
+    if symbol in _M1_CACHE:
+        _M1_CACHE[symbol] = _M1_CACHE.pop(symbol)   # mark as most recently used
+        return _M1_CACHE[symbol]
+    while len(_M1_CACHE) >= M1_CACHE_MAX:
+        _M1_CACHE.pop(next(iter(_M1_CACHE)))
+    _M1_CACHE[symbol] = load(symbol)
     return _M1_CACHE[symbol]
 
 

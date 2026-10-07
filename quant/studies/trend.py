@@ -39,7 +39,8 @@ def daily_bars(symbol: str) -> pd.DataFrame:
     d = resample(m1, "1D")
     full = pd.date_range(d.index[0], d.index[-1], freq="1D", tz="UTC")
     d = d.reindex(full)
-    d.loc[d["gap_frac"] >= 0.05, ["open", "high", "low", "close"]] = np.nan  # outage days unusable
+    # A day with an exchange outage still has a valid last price; only a fully missing day is NaN.
+    d.loc[d["gap_frac"] >= 0.999, ["open", "high", "low", "close"]] = np.nan
     # Fill price for a decision at day close t: VWAP of the 1m bar closing at t + 1min.
     lp = fill_prices(m1, "vwap")
     d["fill"] = lp.reindex(d.index + pd.Timedelta("1min")).to_numpy()

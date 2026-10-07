@@ -278,7 +278,7 @@ class EventSpecialist:
                 action = "LONG" if sig[i] > 0 else "SHORT"
         rt = self.cost.round_trip(symbol) + self.cost.holding(self.h)
         return Signal(action=action, as_of=str(last_t), view=view, cost_bps=round(rt * 1e4, 2),
-                      expected_edge_bps=self.evidence.ev_bps, reasons=reasons,
+                      expected_edge_bps=self.evidence.ev_bps if view else None, reasons=reasons,
                       next_decision=(last_t + pd.Timedelta(minutes=1)).isoformat(), **base)
 
 
@@ -326,11 +326,15 @@ class Engine:
                 else:
                     sig = spec.evaluate(sym, m1, now)
                 sig.regime = regime
+                veto = None
                 if not health["ok"]:
+                    veto = health["problems"][0]
                     sig.action, sig.reasons = "NO TRADE", health["problems"] + sig.reasons
                 elif book is not None and not book["ok"] and sig.action in ("LONG", "SHORT"):
+                    veto = book["problems"][0]
                     sig.action, sig.reasons = "NO TRADE", book["problems"] + sig.reasons
                 d = sig.to_dict()
+                d["veto"] = veto
                 d["data_health"] = health
                 d["book"] = book
                 out.append(d)
@@ -345,7 +349,8 @@ def consensus(signals: list[dict]) -> list[dict]:
       already gated); a RISK_OVERLAY's exposure is allocation guidance, never a trade.
     * Validated specialists pointing opposite ways -> NO TRADE (conflict).
     * ``agreement`` compares the directional views of every specialist, tradeable
-      or not, so the user sees when the evidence lines up and when it does not.
+      or not. It is context only: research found agreement with the daily trend did
+      not make the intraday model more accurate (calibration_regimes.json).
     """
     by_sym: dict[str, list[dict]] = {}
     for s in signals:

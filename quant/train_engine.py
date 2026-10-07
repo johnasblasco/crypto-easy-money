@@ -207,9 +207,14 @@ def evaluate_candidate(c: dict) -> dict:
             pass
     passed = (len(act) >= 30 and np.isfinite(mean) and mean > 0 and p_day < 0.05 and np.isfinite(dsr) and dsr > 0.5)
     status = "VALIDATED" if passed else "NOT_VALIDATED"
-    summary = (f"{c['description']} Holdout: {len(act)} trades, mean net {mean * 1e4 if np.isfinite(mean) else float('nan'):+.1f}bp "
-               f"(day-clustered p={p_day:.3f}), Sharpe {st['sharpe_ann']:.2f}; research-period DSR {dsr:.2f} "
-               f"over {len(trials)} trials. Verdict: {status} (pre-registered criteria).")
+    if len(act):
+        holdout_txt = (f"Holdout: {len(act)} trades, mean net {mean * 1e4 if np.isfinite(mean) else float('nan'):+.1f}bp "
+                       f"(day-clustered p={p_day:.3f}), Sharpe {st['sharpe_ann']:.2f}")
+    else:
+        holdout_txt = ("Holdout: 0 trades - its skill gate failed on the latest validation slice, so it abstained "
+                       "throughout" if not art["skilled"] else "Holdout: 0 trades - no prediction cleared the margin")
+    summary = (f"{c['description']} {holdout_txt}; research-period DSR {dsr:.2f} over {len(trials)} trials. "
+               f"Verdict: {status} (pre-registered criteria).")
     evidence = Evidence(status=status, summary=summary, period=f"holdout {HOLDOUT_START} onward", trades=int(len(act)),
                         ev_bps=float(mean * 1e4) if np.isfinite(mean) else None,
                         ev_p5_bps=float(lo * 1e4) if np.isfinite(lo) else None,

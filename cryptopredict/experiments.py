@@ -14,6 +14,7 @@ summary corrects the p-values for multiple comparisons (Holm's method).
 from __future__ import annotations
 
 import argparse
+import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
@@ -108,7 +109,9 @@ def run_grid(
     args = [(sym, iv, list(horizons), source, limit, fee, out_dir) for sym, iv in pairs]
     rows = []
     if jobs > 1:
-        with ProcessPoolExecutor(max_workers=jobs) as pool:
+        # "spawn", not fork: forking a parent that already runs OpenMP/BLAS threads
+        # (LightGBM, numpy) can deadlock the children.
+        with ProcessPoolExecutor(max_workers=jobs, mp_context=multiprocessing.get_context("spawn")) as pool:
             futures = [pool.submit(_run_pair, *a) for a in args]
             for fut in as_completed(futures):
                 pair_rows, logs = fut.result()

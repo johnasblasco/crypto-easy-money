@@ -222,7 +222,18 @@ Each signal is sent once.
 
 ## Can this make money?
 
-**Short answer: not as it stands, and the app will tell you so.** Here are the
+**Short answer: not as it stands, and the app will tell you so.**
+
+The research engine took this question much further (see
+[docs/RESEARCH_REPORT.md](docs/RESEARCH_REPORT.md)). It used six years of
+1-minute data on 16 coins, realistic costs, hundreds of pre-registered tests,
+and a locked one-year holdout:
+
+- **No short-term trading signal survived.** Short-horizon direction is slightly predictable, but the edge is smaller than trading costs.
+- **The best-looking anomaly was dead out of sample.** Buying altcoins after forced sell-offs made +33 bp per trade in 2020–25 but lost −13.5 bp per trade on the holdout.
+- **The one thing that held up is risk control.** A daily trend overlay cut the worst drawdown from −54% to −22% in a falling market it had never seen.
+
+Below are the results for the original classroom app. Here are the
 real results. Each configuration was trained on Binance data, then tested on
 the most recent 20% of candles that the model never saw. Fees are 0.1% per
 trade.

@@ -437,11 +437,18 @@
         const cells = specs.map((n) => {
           const s = sigs[n];
           if (!s) return "<td class='cell'>—</td>";
-          const a = ACTION[s.action] || ACTION["NO TRADE"];
+          let a = ACTION[s.action] || ACTION["NO TRADE"];
+          const overlay = (s.evidence || {}).status === "RISK_OVERLAY";
+          // An overlay's LONG is position-size guidance, not a trade signal.
+          if (overlay && s.action === "LONG") a = { cls: "flat", label: "SIZE" };
           let detail = "";
           if (s.exposure != null) detail = `exposure ${(s.exposure * 100).toFixed(0)}%`;
-          if (s.expected_edge_bps != null) detail = `edge ${s.expected_edge_bps.toFixed(1)}bp vs cost ${s.cost_bps.toFixed(1)}bp · P ${(s.confidence * 100).toFixed(1)}%`;
-          const why = (s.reasons || []).slice(-1)[0] || "";
+          if (s.expected_edge_bps != null) {
+            detail = `edge ${s.expected_edge_bps.toFixed(1)}bp vs cost ${s.cost_bps.toFixed(1)}bp`;
+            if (s.confidence != null && s.view) detail += ` · P(${s.view === "UP" ? "up" : "down"}) ${(s.confidence * 100).toFixed(1)}%`;
+            if (s.confidence == null) detail = `holdout avg ${s.expected_edge_bps.toFixed(1)}bp/event vs cost ${s.cost_bps.toFixed(1)}bp`;
+          }
+          const why = s.veto || (s.reasons || []).slice(-1)[0] || "";
           return `<td class="cell"><span class="pill ${a.cls}">${a.label}</span> <span class="muted">${esc(detail)}</span>` +
             `<span class="why" title="${esc((s.reasons || []).join(" · "))}">${esc(why)}</span></td>`;
         });

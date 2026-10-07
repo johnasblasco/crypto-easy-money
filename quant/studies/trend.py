@@ -54,8 +54,11 @@ def donchian_state(close: pd.Series, L: int) -> pd.Series:
     on = 0
     c, h, l_ = close.to_numpy(), hi.to_numpy(), lo.to_numpy()
     for i in range(len(c)):
-        if np.isnan(h[i]) or np.isnan(l_[i]):
+        if np.isnan(h[i]) or np.isnan(l_[i]) or np.isnan(c[i]):
+            # Not enough history (or no price): the component is unknown, not "flat".
             on = 0
+            state[i] = np.nan
+            continue
         elif not on and c[i] >= h[i]:
             on = 1
         elif on and c[i] <= l_[i]:

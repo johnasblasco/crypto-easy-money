@@ -6,10 +6,15 @@
 
 This project trains several classifiers to predict whether the **next candle
 closes UP or DOWN**, compares them against naive baselines, and serves the best
-one in a web dashboard with a live candlestick chart.
+one in a web dashboard with a live candlestick chart. A **market scanner**
+checks 9 major tokens on 1h/4h/1d candles and alerts you (browser, Telegram or
+Discord) when a model that passed the edge check says BUY, and for how long to
+hold.
+
+> **Read [Can this make money?](#can-this-make-money) before trading on anything here.**
 
 ![Dashboard](docs/dashboard.png)
-<sub>Screenshot uses the built-in synthetic data, so the numbers in it say nothing about real markets.</sub>
+<sub>Real Binance data, October 2026.</sub>
 
 ## Quick start
 
@@ -23,8 +28,14 @@ python -m cryptopredict.train --source binance --symbol BTCUSDT --interval 1h --
 # 2. One-off prediction in the terminal
 python -m cryptopredict.predict
 
-# 3. Dashboard at http://127.0.0.1:8000
+# 3. Train + validate every token/timeframe for the scanner (takes ~30-60 min)
+python -m cryptopredict.experiments
+
+# 4. Dashboard at http://127.0.0.1:8000
 uvicorn app.server:app --reload
+
+# 5. Optional: scan in the terminal every 15 min and send Telegram/Discord alerts
+python -m cryptopredict.scanner --watch 15
 ```
 
 No internet, or Binance blocked where you are? Use `--source synthetic` to run
@@ -117,9 +128,80 @@ The dashboard refreshes every minute. Settings come from environment variables:
 - `CANDLES` — number of candles on the chart
 - `MODEL_PATH` — trained model to load
 
+### 6. Edge check — would it have made money?
+Every training run ends with a plain-language verdict, shown at the top of the
+dashboard and in `report.md`:
+
+| Verdict | Meaning |
+|---|---|
+| **POSSIBLE EDGE** | Beat the baselines with statistical significance (p < 0.05) **and** beat buy & hold after fees on unseen data |
+| **NO PROFIT** | Significantly more accurate, but the gain doesn't survive fees or doesn't beat buy & hold |
+| **UNPROVEN** | Made money on the test period, but not statistically better than the baselines, so the profit is most likely luck |
+| **NO EDGE** | Not better than the baselines |
+
+How the check works:
+- **The baseline is strict.** It's the best of: always predicting the training majority, repeating the last move, or the best constant guess in hindsight.
+- **Confidence threshold.** The model only trades when its confidence passes a threshold. The threshold is chosen on the training period's walk-forward predictions, never on the test period.
+- **Many-comparison correction.** `cryptopredict.experiments` tests many configurations, so some will look good by chance. It applies Holm's correction across all of them.
+
+### 7. Market scanner and alerts — `cryptopredict/scanner.py`
+The scanner runs every model trained by `cryptopredict.experiments` on the
+latest candles. It gives each one a status:
+
+| Status | Meaning |
+|---|---|
+| **▲ BUY** | Validated model, confident UP call. Buy and hold for the time shown (horizon × candle size), then exit. |
+| **▼ AVOID** | Validated model, confident DOWN call |
+| **• WAIT** | Validated model, but below its confidence threshold |
+| **not validated** | The model failed the edge check. Its prediction is listed for information, **never** as a signal. |
+
+Ways to use it:
+- **Dashboard:** the scanner is at the top. Click a row to load that token's chart and model. **Enable alerts** turns on browser notifications for new BUY signals while the page is open.
+- **Phone alerts:** run `python -m cryptopredict.scanner --watch 15` with either or both set:
+  - Telegram: `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`. Create a bot with @BotFather, message it once, then read your chat id from `https://api.telegram.org/bot<TOKEN>/getUpdates`.
+  - Discord: `DISCORD_WEBHOOK_URL`
+
+Each signal is sent once.
+
+**Retrain regularly.** Markets change, so rerun `cryptopredict.experiments` every week or two. The scanner always uses the latest saved models.
+
+## Can this make money?
+
+**Short answer: not as it stands, and the app will tell you so.** Here are the
+real results. Each configuration was trained on Binance data, then tested on
+the most recent 20% of candles that the model never saw. Fees are 0.1% per
+trade.
+
+First run, October 2026 (BTC, ETH and SOL × 1h/4h/1d × 1 and 3 candles ahead):
+**0 of 18 configurations passed the edge check.**
+- The best accuracies were around 52–54%, never significantly above the baselines.
+- Strategy returns at the chosen confidence threshold mostly lost to buy & hold.
+- Three configurations made money in the test period (ETH 4h, ETH 1d, SOL 1d), but with p-values of 0.3–0.4: the kind of result luck produces when you test many things.
+
+Run `python -m cryptopredict.experiments` to reproduce this on current data. The full table is written to `models/experiments/summary.md`.
+
+Why this is the expected result:
+- **Price direction is close to a coin flip.** At these timeframes, past price and volume patterns carry very little information about the next move. Thousands of professional funds trade on the same indicators, so any obvious pattern gets traded away.
+- **Fees are the killer.** A model that is 52% right on hourly candles gives up its tiny edge to 0.1% fees on every trade. That's why longer candles and the confidence threshold exist: fewer, stronger trades.
+- **"UNPROVEN" rows are a trap.** A few configurations made money on the test period. With dozens of configurations tested, some will do well by luck; the p-values show these did.
+
+If a configuration ever shows **POSSIBLE EDGE**, don't trust it straight away.
+**Paper-trade it** (follow the alerts without real money) for several weeks of
+new data first. Only consider real money if the edge holds, and only money you
+can afford to lose.
+
+*This is an educational project, not financial advice.*
+
 ## Experiments to run for the paper
 
-The CLI flags map directly to the research variables:
+The quickest way is the experiment runner. It trains every combination and
+writes one comparison table to `models/experiments/summary.md`:
+
+```bash
+python -m cryptopredict.experiments --symbols BTCUSDT ETHUSDT SOLUSDT --intervals 1h 4h 1d --horizons 1 3
+```
+
+Or run single configurations; the CLI flags map directly to the research variables:
 
 ```bash
 # Different coins
@@ -164,10 +246,12 @@ cryptopredict/
   data.py        Binance / CSV / synthetic loaders
   features.py    indicators, features, target
   models.py      classifiers compared in the study
-  train.py       evaluation pipeline + CLI
+  train.py       evaluation pipeline, edge check + CLI
+  experiments.py many tokens x intervals x horizons, with multiple-comparison correction
+  scanner.py     live BUY/AVOID/WAIT signals + Telegram/Discord alerts
   predict.py     next-candle prediction + CLI
 app/
-  server.py      FastAPI backend (/api/dashboard)
+  server.py      FastAPI backend (/api/dashboard, /api/scanner)
   static/        dashboard HTML/CSS/JS + vendored chart library
 tests/           unit and end-to-end tests
 ```

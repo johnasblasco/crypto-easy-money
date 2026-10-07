@@ -83,6 +83,8 @@ def predict_latest(df: pd.DataFrame, bundle: dict) -> dict:
     latest = feats.dropna(subset=bundle["features"]).iloc[-1]
     prob_up = float(bundle["model"].predict_proba(latest[bundle["features"]].to_frame().T.astype(float))[0, 1])
     direction = "UP" if prob_up >= 0.5 else "DOWN"
+    confidence = prob_up if direction == "UP" else 1 - prob_up
+    threshold = bundle.get("threshold", 0.5)
     prev_close = feats["close"].iloc[-2]
     return {
         "symbol": bundle["symbol"],
@@ -95,7 +97,11 @@ def predict_latest(df: pd.DataFrame, bundle: dict) -> dict:
         "change": float(latest["close"] / prev_close - 1),
         "direction": direction,
         "prob_up": prob_up,
-        "confidence": prob_up if direction == "UP" else 1 - prob_up,
+        "confidence": confidence,
+        # The model only acts on calls at least this confident (chosen during training).
+        "threshold": threshold,
+        "actionable": bool(confidence >= threshold),
+        "edge_verdict": bundle.get("edge_verdict"),
         "indicators": describe_indicators(latest),
     }
 

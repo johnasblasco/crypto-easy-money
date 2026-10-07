@@ -17,6 +17,9 @@
 
   let charts = null;
   let lastData = null;
+  // Which model the chart shows: null = main model, else an experiments config like "ETHUSDT_4h_h1".
+  let currentConfig = decodeURIComponent(location.hash.slice(1)) || null;
+  let lastScan = null;
 
   function chartOptions(height, attribution) {
     return {
@@ -186,6 +189,15 @@
     const fill = $("meter-fill");
     fill.style.width = `${(p.prob_up * 100).toFixed(1)}%`;
     fill.style.background = isUp ? css("--up") : css("--down");
+    const ts = $("trade-status");
+    const validated = p.edge_verdict === "POSSIBLE EDGE";
+    if (!validated) {
+      ts.innerHTML = `This model failed the edge check (<b>${p.edge_verdict || "unknown"}</b>), so this call is <b>not a trading signal</b>.`;
+    } else if (p.actionable) {
+      ts.innerHTML = `Clears the <b>${fmtPct(p.threshold, 0)}</b> confidence threshold — a validated signal.`;
+    } else {
+      ts.innerHTML = `Below the <b>${fmtPct(p.threshold, 0)}</b> confidence threshold — <b>no trade</b>.`;
+    }
     $("prob-up").textContent = fmtPct(p.prob_up);
     $("model").textContent = p.model;
     $("as-of").textContent = fmtTime(p.as_of);
@@ -211,6 +223,7 @@
         const name = r.model === m.best_model ? `${r.model} ★` : r.model;
         return (
           `<tr class="${cls}"><td>${name}</td><td>${fmtPct(r.cv_accuracy)}</td><td>${fmtPct(r.accuracy)}</td>` +
+          `<td>${r.p_vs_baseline == null ? "—" : r.p_vs_baseline.toFixed(3)}</td>` +
           `<td>${fmtPct(r.precision)}</td><td>${fmtPct(r.recall)}</td><td>${fmtPct(r.f1)}</td>` +
           `<td>${r.roc_auc == null ? "—" : r.roc_auc.toFixed(3)}</td>` +
           `<td>${fmtSignedPct(r.strategy_return)}</td><td>${fmtSignedPct(r.buy_and_hold_return)}</td></tr>`
@@ -220,12 +233,44 @@
     $("models-note").textContent =
       `★ selected by walk-forward cross-validation accuracy (not by test score). ` +
       `Test set is ${fmtPct(m.test_up_share)} UP candles, so that's what "always UP" would score. ` +
-      `Strategy = long-only, hold one candle when the model says UP, ${(m.fee * 100).toFixed(2)}% fee per trade.`;
+      `p vs baseline below 0.05 means the model beat the best baseline or constant guess (${fmtPct(m.best_baseline_accuracy)}) ` +
+      `by more than luck would explain. ` +
+      `Strategy = long-only, hold ${m.horizon} candle(s) when the model says UP, ${(m.fee * 100).toFixed(2)}% fee per trade.`;
+    renderEdge(m.edge, m);
+  }
+
+  function renderEdge(edge, m) {
+    if (!edge) return;
+    const tone = { "POSSIBLE EDGE": "good", "NO EDGE": "bad" }[edge.verdict] || "warn";
+    const icon = { good: "✓", bad: "⚠", warn: "!" }[tone];
+    $("edge").className = `card wide edge ${tone}`;
+    $("edge").hidden = false;
+    $("edge-icon").textContent = icon;
+    $("edge-verdict").textContent = edge.verdict;
+    $("edge-summary").textContent =
+      `${edge.summary} On unseen data at the ${fmtPct(edge.threshold, 0)} threshold: strategy ` +
+      `${fmtSignedPct(edge.strategy_return)} vs buy & hold ${fmtSignedPct(edge.buy_and_hold_return)}.`;
+
+    $("threshold-model").textContent = `· ${m.best_model}, held-out test period`;
+    $("thresholds").innerHTML = edge.test_thresholds
+      .map((r) => {
+        const chosen = r.threshold === edge.threshold;
+        return (
+          `<tr class="${chosen ? "best" : ""}"><td>${fmtPct(r.threshold, 0)}${chosen ? " ★" : ""}</td>` +
+          `<td>${r.calls}</td><td>${fmtPct(r.coverage)}</td><td>${fmtPct(r.accuracy)}</td>` +
+          `<td>${fmtSignedPct(r.strategy_return)}</td><td>${fmtSignedPct(r.buy_and_hold_return)}</td></tr>`
+        );
+      })
+      .join("");
+    $("thresholds-note").textContent =
+      `The model only trades when it is at least this confident. ★ was chosen on the training period, ` +
+      `before the test data was seen; picking the best row after the fact would be cheating.`;
   }
 
   async function load(keepRange) {
     try {
-      const res = await fetch("/api/dashboard");
+      const url = currentConfig ? `/api/dashboard?config=${encodeURIComponent(currentConfig)}` : "/api/dashboard";
+      const res = await fetch(url);
       const body = await res.json();
       if (!res.ok) throw new Error(body.detail || res.statusText);
       lastData = body;
@@ -239,6 +284,116 @@
     }
   }
 
+  const STATUS = {
+    BUY: { cls: "buy", label: "▲ BUY" },
+    AVOID: { cls: "avoid", label: "▼ AVOID" },
+    WAIT: { cls: "wait", label: "• WAIT" },
+    "NOT VALIDATED": { cls: "none", label: "not validated" },
+    ERROR: { cls: "none", label: "error" },
+  };
+
+  function renderScanner(data) {
+    const rows = data.rows || [];
+    $("scan-time").textContent = rows.length ? `· updated ${fmtTime(data.scanned_at)}` : "";
+    if (!rows.length) {
+      $("scanner").innerHTML =
+        '<tr><td colspan="8">No token models yet. Run <code>python -m cryptopredict.experiments</code> to train and validate them.</td></tr>';
+      $("scanner-note").textContent = "";
+      return;
+    }
+    $("scanner").innerHTML = rows
+      .map((r) => {
+        const st = STATUS[r.status] || STATUS.ERROR;
+        const cls = [r.status === "NOT VALIDATED" ? "unvalidated" : "", r.config === currentConfig ? "active" : ""].join(" ");
+        if (r.status === "ERROR") {
+          return `<tr class="${cls}"><td><span class="pill none">error</span></td><td>${r.symbol}</td><td>${r.interval}</td><td colspan="5">${r.error}</td></tr>`;
+        }
+        const call = r.direction === "UP" ? '<span class="up">▲</span> UP' : '<span class="down">▼</span> DOWN';
+        return (
+          `<tr class="${cls}" data-config="${r.config}" tabindex="0">` +
+          `<td><span class="pill ${st.cls}">${st.label}</span></td><td>${r.symbol}</td><td>${r.interval}</td>` +
+          `<td>${r.hold}</td><td>${call}</td><td>${fmtPct(r.confidence)}</td><td>${fmtPrice(r.price)}</td>` +
+          `<td>${r.verdict}</td></tr>`
+        );
+      })
+      .join("");
+    const validated = rows.filter((r) => r.verdict === "POSSIBLE EDGE").length;
+    const buys = rows.filter((r) => r.status === "BUY").length;
+    $("scanner-note").textContent =
+      validated === 0
+        ? "No token/timeframe passed the edge check on unseen data, so nothing here is a signal to act on. " +
+          "Predictions are shown for information only. Click a row to see its chart."
+        : `${validated} validated model(s), ${buys} BUY signal(s) right now. Only validated models can signal; ` +
+          "hold for the time shown, then exit. Click a row to see its chart. Not financial advice.";
+  }
+
+  function notifyNewBuys(data) {
+    if (!("Notification" in window) || Notification.permission !== "granted") return;
+    let seen = [];
+    try { seen = JSON.parse(localStorage.getItem("seenSignals") || "[]"); } catch (e) { seen = []; }
+    const fresh = (data.rows || []).filter((r) => r.status === "BUY" && !seen.includes(`${r.config}|${r.signal_time}`));
+    fresh.forEach((r) => {
+      new Notification(`BUY ${r.symbol} — hold ${r.hold}`, {
+        body: `${fmtPct(r.confidence)} confidence on ${r.interval} candles @ ${fmtPrice(r.price)}`,
+        tag: r.config,
+      });
+      seen.push(`${r.config}|${r.signal_time}`);
+    });
+    try { localStorage.setItem("seenSignals", JSON.stringify(seen.slice(-500))); } catch (e) { /* storage unavailable */ }
+  }
+
+  async function loadScanner() {
+    try {
+      const res = await fetch("/api/scanner");
+      if (!res.ok) throw new Error(res.statusText);
+      lastScan = await res.json();
+      renderScanner(lastScan);
+      notifyNewBuys(lastScan);
+    } catch (err) {
+      $("scanner-note").textContent = `Could not run the scanner: ${err.message}`;
+    }
+  }
+
+  function selectConfig(config) {
+    currentConfig = config;
+    history.replaceState(null, "", config ? `#${config}` : location.pathname);
+    if (lastScan) renderScanner(lastScan);
+    load(false);
+    window.scrollTo({ top: $("price-chart").getBoundingClientRect().top + window.scrollY - 140, behavior: "smooth" });
+  }
+
+  $("scanner").addEventListener("click", (e) => {
+    const row = e.target.closest("tr[data-config]");
+    if (row) selectConfig(row.dataset.config);
+  });
+  $("scanner").addEventListener("keydown", (e) => {
+    const row = e.target.closest("tr[data-config]");
+    if (row && (e.key === "Enter" || e.key === " ")) {
+      e.preventDefault();
+      selectConfig(row.dataset.config);
+    }
+  });
+
+  function updateAlertsButton() {
+    const btn = $("alerts-btn");
+    if (!("Notification" in window)) {
+      btn.textContent = "Alerts not supported";
+      btn.disabled = true;
+    } else if (Notification.permission === "granted") {
+      btn.textContent = "Alerts on";
+      btn.disabled = true;
+    } else if (Notification.permission === "denied") {
+      btn.textContent = "Alerts blocked";
+      btn.disabled = true;
+    }
+  }
+  $("alerts-btn").addEventListener("click", async () => {
+    await Notification.requestPermission();
+    updateAlertsButton();
+    if (lastScan) notifyNewBuys(lastScan);
+  });
+  updateAlertsButton();
+
   $("show-markers").addEventListener("change", () => lastData && renderCharts(lastData, true));
   window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
     createCharts();
@@ -247,5 +402,7 @@
 
   createCharts();
   load(false);
+  loadScanner();
   setInterval(() => load(true), REFRESH_MS);
+  setInterval(loadScanner, 2 * REFRESH_MS);
 })();

@@ -30,6 +30,10 @@ def test_training_writes_artifacts(trained):
         assert 0 <= r["accuracy"] <= 1
         assert 0 <= r["roc_auc"] <= 1
         assert "cv_accuracy" in r
+        assert 0 <= r["p_vs_baseline"] <= 1
+    edge = saved["edge"]
+    assert edge["verdict"] in {"POSSIBLE EDGE", "NO PROFIT", "UNPROVEN", "NO EDGE"}
+    assert edge["threshold"] in [r["threshold"] for r in edge["test_thresholds"]]
 
 
 def test_test_set_comes_after_training_data(trained):
@@ -50,6 +54,8 @@ def test_predict_latest(trained):
     assert 0 <= result["prob_up"] <= 1
     assert 0.5 <= result["confidence"] <= 1
     assert len(result["indicators"]) == 6
+    assert result["threshold"] == bundle["threshold"]
+    assert result["actionable"] == (result["confidence"] >= result["threshold"])
 
 
 def test_dashboard_api(trained, monkeypatch):
@@ -57,7 +63,7 @@ def test_dashboard_api(trained, monkeypatch):
 
     out, _ = trained
     monkeypatch.setattr(server, "MODEL_PATH", out / "model.joblib")
-    server._cache.update(at=0.0, payload=None, model_mtime=None)
+    server._cache.clear()
     client = TestClient(server.app)
 
     resp = client.get("/api/dashboard")
@@ -68,6 +74,7 @@ def test_dashboard_api(trained, monkeypatch):
     assert body["history"], "expected out-of-sample predictions on the chart"
     candle_times = {c["time"] for c in body["candles"]}
     assert all(h["time"] in candle_times for h in body["history"])
+    assert body["metrics"]["edge"]["verdict"]
 
     assert client.get("/").status_code == 200
 
@@ -76,7 +83,7 @@ def test_dashboard_without_model(tmp_path, monkeypatch):
     from app import server
 
     monkeypatch.setattr(server, "MODEL_PATH", tmp_path / "missing.joblib")
-    server._cache.update(at=0.0, payload=None, model_mtime=None)
+    server._cache.clear()
     resp = TestClient(server.app).get("/api/dashboard")
     assert resp.status_code == 503
     assert "train" in resp.json()["detail"]

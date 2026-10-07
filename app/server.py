@@ -5,15 +5,18 @@ Run:
 then open http://127.0.0.1:8000
 
 Environment variables:
-    MODEL_PATH   trained bundle (default models/model.joblib)
-    DATA_SOURCE  binance | csv | synthetic (default: the source used in training)
-    CANDLES      candles shown on the chart (default 300)
+    MODEL_PATH       trained bundle (default models/model.joblib)
+    EXPERIMENTS_DIR  models from `cryptopredict.experiments` (default models/experiments),
+                     used by the market scanner and the per-token charts
+    DATA_SOURCE      binance | csv | synthetic (default: the source used in training)
+    CANDLES          candles shown on the chart (default 300)
 """
 from __future__ import annotations
 
 import json
 import math
 import os
+import re
 import time
 from pathlib import Path
 
@@ -25,19 +28,24 @@ from fastapi.staticfiles import StaticFiles
 from cryptopredict.data import load_data
 from cryptopredict.features import add_features
 from cryptopredict.predict import load_bundle, predict_latest
+from cryptopredict.scanner import scan
 from cryptopredict.train import MODELS_DIR
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 MODEL_PATH = Path(os.environ.get("MODEL_PATH", MODELS_DIR / "model.joblib"))
+EXPERIMENTS_DIR = Path(os.environ.get("EXPERIMENTS_DIR", MODELS_DIR / "experiments"))
 CANDLES = int(os.environ.get("CANDLES", 300))
 # Indicators need ~50 candles of warm-up before the first chart candle.
 WARMUP = 60
 CACHE_SECONDS = 30
+SCAN_CACHE_SECONDS = 120
+CONFIG_NAME = re.compile(r"^[A-Z0-9]{2,20}_[0-9]{1,2}[mhd]_h[0-9]{1,3}$")
 
 app = FastAPI(title="Crypto Direction Predictor")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
-_cache: dict = {"at": 0.0, "payload": None, "model_mtime": None}
+# (kind, model path) -> {"at": time, "mtime": model mtime, "payload": ...}
+_cache: dict = {}
 
 
 def _num(v):
@@ -47,11 +55,22 @@ def _num(v):
     return None if math.isnan(v) or math.isinf(v) else v
 
 
+def _json_safe(obj):
+    """Replace NaN/inf (invalid in JSON) with None, recursively."""
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
+        return None
+    return obj
+
+
 def _unix(ts: pd.Timestamp) -> int:
     return int(ts.timestamp())
 
 
-def _out_of_sample_predictions(feats: pd.DataFrame, bundle: dict) -> pd.DataFrame:
+def _out_of_sample_predictions(feats: pd.DataFrame, bundle: dict, model_dir: Path) -> pd.DataFrame:
     """Predictions the model made without having seen the outcome.
 
     Combines the held-out test-set predictions saved at training time with
@@ -59,7 +78,7 @@ def _out_of_sample_predictions(feats: pd.DataFrame, bundle: dict) -> pd.DataFram
     candles are never shown, because their hit rate would be flattering.
     """
     frames = []
-    test_path = MODEL_PATH.parent / "test_predictions.csv"
+    test_path = model_dir / "test_predictions.csv"
     if test_path.exists():
         test = pd.read_csv(test_path, parse_dates=["timestamp"])
         frames.append(test[["timestamp", "prob_up"]])
@@ -85,9 +104,9 @@ def _out_of_sample_predictions(feats: pd.DataFrame, bundle: dict) -> pd.DataFram
     return preds.sort_values("timestamp")
 
 
-def build_dashboard() -> dict:
+def build_dashboard(model_path: Path) -> dict:
     try:
-        bundle = load_bundle(MODEL_PATH)
+        bundle = load_bundle(model_path)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
@@ -99,7 +118,7 @@ def build_dashboard() -> dict:
 
     prediction = predict_latest(df, bundle)
     feats = add_features(df).iloc[-CANDLES:]
-    preds = _out_of_sample_predictions(feats, bundle)
+    preds = _out_of_sample_predictions(feats, bundle, model_path.parent)
 
     candles = [
         {
@@ -127,8 +146,8 @@ def build_dashboard() -> dict:
     scored = [h for h in history if h["actual"] is not None]
     hits = sum(h["prediction"] == h["actual"] for h in scored)
 
-    metrics_path = MODEL_PATH.parent / "metrics.json"
-    metrics = json.loads(metrics_path.read_text()) if metrics_path.exists() else None
+    metrics_path = model_path.parent / "metrics.json"
+    metrics = _json_safe(json.loads(metrics_path.read_text())) if metrics_path.exists() else None
 
     return {
         "source": source,
@@ -141,13 +160,41 @@ def build_dashboard() -> dict:
     }
 
 
+def _cached(key, path: Path, ttl: float, build):
+    mtime = path.stat().st_mtime if path.exists() else None
+    entry = _cache.get(key)
+    if entry is None or time.time() - entry["at"] >= ttl or entry["mtime"] != mtime:
+        entry = {"payload": build(), "at": time.time(), "mtime": mtime}
+        _cache[key] = entry
+    return entry["payload"]
+
+
 @app.get("/api/dashboard")
-def dashboard():
-    mtime = MODEL_PATH.stat().st_mtime if MODEL_PATH.exists() else None
-    fresh = time.time() - _cache["at"] < CACHE_SECONDS and _cache["model_mtime"] == mtime
-    if not fresh or _cache["payload"] is None:
-        _cache.update(payload=build_dashboard(), at=time.time(), model_mtime=mtime)
-    return _cache["payload"]
+def dashboard(config: str | None = None):
+    """Chart data for the main model, or for one experiments model (e.g. ETHUSDT_4h_h1)."""
+    if config is None:
+        model_path = MODEL_PATH
+    else:
+        if not CONFIG_NAME.match(config):
+            raise HTTPException(status_code=400, detail="Invalid config name")
+        model_path = EXPERIMENTS_DIR / config / "model.joblib"
+        if not model_path.exists():
+            raise HTTPException(status_code=404, detail=f"No trained model for {config}")
+    return _cached(("dashboard", str(model_path)), model_path, CACHE_SECONDS, lambda: build_dashboard(model_path))
+
+
+@app.get("/api/scanner")
+def scanner():
+    """Current signal for every token/timeframe trained by `cryptopredict.experiments`."""
+    summary = EXPERIMENTS_DIR / "summary.csv"
+
+    def build():
+        rows = scan(EXPERIMENTS_DIR, os.environ.get("DATA_SOURCE"))
+        for r in rows:
+            r["config"] = f"{r['symbol']}_{r['interval']}_h{r['horizon']}"
+        return {"rows": _json_safe(rows), "scanned_at": pd.Timestamp.now(tz="UTC").isoformat()}
+
+    return _cached(("scanner", str(summary)), summary, SCAN_CACHE_SECONDS, build)
 
 
 @app.get("/")

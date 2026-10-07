@@ -23,6 +23,33 @@
   <div id="error" class="error" hidden></div>
 
   <main class="layout">
+    <section class="card wide edge" id="edge" hidden>
+      <div class="edge-icon" id="edge-icon" aria-hidden="true"></div>
+      <div>
+        <div class="edge-title">Edge check: <span id="edge-verdict"></span></div>
+        <div class="edge-summary" id="edge-summary"></div>
+      </div>
+    </section>
+
+    <section class="card wide" id="scanner-card">
+      <div class="scanner-head">
+        <h2>Market scanner <span class="muted" id="scan-time"></span></h2>
+        <button id="alerts-btn" class="btn" type="button">Enable alerts</button>
+      </div>
+      <div class="table-scroll">
+        <table class="models scanner">
+          <thead>
+            <tr>
+              <th>Signal</th><th>Token</th><th>Candle</th><th>Hold for</th><th>Call</th>
+              <th>Confidence</th><th>Price</th><th>Model check</th>
+            </tr>
+          </thead>
+          <tbody id="scanner"></tbody>
+        </table>
+      </div>
+      <p class="note" id="scanner-note"></p>
+    </section>
+
     <section class="card chart-card">
       <div class="chart-head">
         <div class="legend" id="legend" aria-live="polite"></div>
@@ -53,6 +80,7 @@
           <div class="meter-mid"></div>
         </div>
         <div class="meter-scale"><span>DOWN</span><span>50%</span><span>UP</span></div>
+        <div class="trade-status" id="trade-status"></div>
         <dl class="meta">
           <dt>P(UP)</dt><dd id="prob-up">—</dd>
           <dt>Model</dt><dd id="model">—</dd>
@@ -75,7 +103,7 @@
         <table class="models">
           <thead>
             <tr>
-              <th>Model</th><th>CV acc</th><th>Accuracy</th><th>Precision</th>
+              <th>Model</th><th>CV acc</th><th>Accuracy</th><th>p vs baseline</th><th>Precision</th>
               <th>Recall</th><th>F1</th><th>ROC AUC</th><th>Strategy</th><th>Buy &amp; hold</th>
             </tr>
           </thead>
@@ -83,6 +111,21 @@
         </table>
       </div>
       <p class="note" id="models-note"></p>
+    </section>
+
+    <section class="card wide">
+      <h2>Only trading confident calls <span class="muted" id="threshold-model"></span></h2>
+      <div class="table-scroll">
+        <table class="models thresholds">
+          <thead>
+            <tr>
+              <th>Confidence ≥</th><th>Trades</th><th>Coverage</th><th>Accuracy</th><th>Strategy</th><th>Buy &amp; hold</th>
+            </tr>
+          </thead>
+          <tbody id="thresholds"></tbody>
+        </table>
+      </div>
+      <p class="note" id="thresholds-note"></p>
     </section>
   </main>
 

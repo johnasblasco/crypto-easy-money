@@ -6,6 +6,7 @@ time, with ``timestamp`` as a timezone-aware UTC datetime.
 from __future__ import annotations
 
 import time
+import zlib
 from pathlib import Path
 
 import numpy as np
@@ -170,7 +171,7 @@ def load_csv(path: str | Path) -> pd.DataFrame:
     if missing:
         raise ValueError(f"{path} is missing columns: {sorted(missing)}")
     df = df[COLUMNS].copy()
-    if np.issubdtype(df["timestamp"].dtype, np.number):
+    if pd.api.types.is_numeric_dtype(df["timestamp"]):
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
     else:
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
@@ -199,5 +200,6 @@ def load_data(
     if source == "csv":
         return load_csv(csv_path or cache_path(symbol, interval))
     if source == "synthetic":
-        return generate_synthetic(n=limit, interval=interval)
+        # A different (but repeatable) series per symbol.
+        return generate_synthetic(n=limit, interval=interval, seed=zlib.crc32(symbol.upper().encode()))
     raise ValueError(f"Unknown data source {source!r}")

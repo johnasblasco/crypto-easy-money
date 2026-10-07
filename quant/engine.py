@@ -318,6 +318,7 @@ class Engine:
             paper.load_health(specialists)
 
     def run(self, now: pd.Timestamp | None = None, sync: bool = True) -> list[dict]:
+        live = now is None
         now = now or pd.Timestamp.now(tz="UTC")
         others = None
         out = []
@@ -329,6 +330,10 @@ class Engine:
                 frames[sym] = self.store.frame(sym)
             except Exception as exc:  # network etc.
                 frames[sym] = exc
+        if live:
+            # Syncing 16 coins can take minutes on a cold start: judge freshness and entry
+            # windows against the clock after the data arrived, not before.
+            now = pd.Timestamp.now(tz="UTC")
         closes = {s: np.log(f["close"]).ffill() for s, f in frames.items() if isinstance(f, pd.DataFrame)}
         if self.paper is not None:          # resolve matured paper trades first, so health is current
             self.paper.resolve({s: f for s, f in frames.items() if isinstance(f, pd.DataFrame)}, self.specialists)

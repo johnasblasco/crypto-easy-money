@@ -11,3 +11,6 @@ data/*
 models/*
 !models/.gitkeep
 logs/
+
+# Local secrets for docker compose
+.env

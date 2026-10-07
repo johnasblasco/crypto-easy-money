@@ -44,6 +44,52 @@ with any CSV that has `timestamp,open,high,low,close,volume` columns.
 
 Run the tests with `pytest`.
 
+## Run with Docker
+
+You need Docker Desktop (Mac/Windows) or Docker Engine with the Compose plugin
+(Linux). The image runs on Intel/AMD and Apple Silicon. Your downloaded data
+and trained models live in the `data/` and `models/` folders of the repo,
+mounted into the container. They survive rebuilds and are shared with a
+non-Docker install.
+
+```bash
+cp .env.example .env               # optional: alert tokens and settings (see the file)
+docker compose build
+
+# Train the classroom model, then start the dashboard at http://localhost:8000
+docker compose run --rm web python -m cryptopredict.train --source binance --symbol BTCUSDT --interval 1h --limit 5000
+docker compose up -d
+docker compose logs -f web         # Ctrl+C stops following, not the app
+```
+
+Any command from this README runs in the container when you prefix it with
+`docker compose run --rm web`. For example:
+
+```bash
+docker compose run --rm web python -m cryptopredict.experiments   # models for the scanner (30-60 min)
+docker compose run --rm web python -m quant.data download          # research data (~3 GB in ./data)
+docker compose run --rm web python -m pytest -q                    # test suite
+```
+
+Long-running extras are Compose profiles. They restart automatically and read
+their settings from `.env`:
+
+```bash
+docker compose --profile alerts up -d     # scanner every 15 min -> Telegram/Discord
+docker compose --profile recorder up -d   # forward order-book recorder for future research
+docker compose down                       # stop everything (data and models stay)
+```
+
+To update after `git pull`: `docker compose build && docker compose up -d`.
+
+Notes:
+- **Signal engine:** the dashboard's engine card needs `models/engine/`, made by `python -m quant.train_engine` after the research studies (see [Research engine](#research-engine--quant)). Until then it says "not trained yet".
+  - Its first load syncs every coin from Binance and can take a few minutes. After that it is incremental.
+- **Memory:** the dashboard needs about 1–2 GB. The research studies and `quant.train_engine` need about 8 GB, so raise Docker Desktop's memory limit (Settings → Resources) before running them.
+- **Linux file ownership:** the container runs as an unprivileged user with uid 1000. If your user id differs (`id -u`), set `HOST_UID` and `HOST_GID` in `.env` and rebuild, so files written to `data/` and `models/` stay yours.
+- **`toomanyrequests` while building:** Docker Hub has rate-limited image pulls. Set `BASE_IMAGE=mirror.gcr.io/library/python:3.13-slim` in `.env` and build again.
+- **Pinned versions:** the image installs the exact package versions the tests passed with (`constraints.txt`). For the same versions natively: `pip install -r requirements.txt -c constraints.txt`.
+
 ## Research engine — `quant/`
 
 The `cryptopredict/` app above is the original classroom project. `quant/` is

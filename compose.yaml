@@ -1,0 +1,47 @@
+# Dashboard:      docker compose up -d            -> http://localhost:8000
+# One-off jobs:   docker compose run --rm web python -m quant.data download
+# Phone alerts:   docker compose --profile alerts up -d
+# Book recorder:  docker compose --profile recorder up -d
+#
+# Settings (alert tokens, ENGINE_* options, HOST_UID/HOST_GID) go in a .env file
+# next to this one; see .env.example. data/ and models/ are mounted from this
+# folder, so downloads and trained models survive rebuilds and are shared with a
+# native (non-Docker) install.
+
+x-app: &app
+  image: crypto-easy-money:latest
+  build:
+    context: .
+    args:
+      BASE_IMAGE: ${BASE_IMAGE:-python:3.13-slim}
+      UID: ${HOST_UID:-1000}
+      GID: ${HOST_GID:-1000}
+  volumes:
+    - ./data:/app/data
+    - ./models:/app/models
+  env_file:
+    - path: .env
+      required: false
+
+services:
+  web:
+    <<: *app
+    ports:
+      - "${PORT:-8000}:8000"
+    restart: unless-stopped
+
+  scanner:
+    <<: *app
+    profiles: ["alerts"]
+    command: ["python", "-m", "cryptopredict.scanner", "--watch", "15"]
+    healthcheck:
+      disable: true
+    restart: unless-stopped
+
+  recorder:
+    <<: *app
+    profiles: ["recorder"]
+    command: ["python", "-m", "quant.record_book", "--symbols", "BTCUSDT", "ETHUSDT", "SOLUSDT", "--every", "10"]
+    healthcheck:
+      disable: true
+    restart: unless-stopped

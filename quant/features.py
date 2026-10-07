@@ -357,6 +357,15 @@ def long_trend(g: Grid, m1: pd.DataFrame) -> dict:
     return {c: aligned[c].to_numpy(float) for c in frame.columns}
 
 
+def trend_ensemble(g: Grid, m1: pd.DataFrame) -> dict:
+    """The 9-component daily trend ensemble S in [0, 1] (quant/studies/trend.py), as of t."""
+    from .studies import trend as T
+
+    S = T.ensemble(T.daily_bars("", m1)["close"])
+    aligned = _asof(S.to_frame("ens__trend_ensemble"), g.times)
+    return {"ens__trend_ensemble": aligned["ens__trend_ensemble"].to_numpy(float)}
+
+
 def fear_greed(g: Grid) -> dict:
     from .data import load_fng
 
@@ -375,7 +384,7 @@ def fear_greed(g: Grid) -> dict:
     return out
 
 
-FAMILIES = ["mom", "vol", "act", "flow", "shape", "range", "regime", "cal", "xa", "ta", "trend", "fng"]
+FAMILIES = ["mom", "vol", "act", "flow", "shape", "range", "regime", "cal", "xa", "ta", "trend", "fng", "ens"]
 
 
 def classic_indicators(m1: pd.DataFrame, times: pd.DatetimeIndex, rule: str = "1h") -> dict:
@@ -431,5 +440,7 @@ def build(m1: pd.DataFrame, times: pd.DatetimeIndex, symbol: str, others: dict |
         cols.update(long_trend(g, m1))
     if "fng" in families:
         cols.update(fear_greed(g))
+    if "ens" in families:
+        cols.update(trend_ensemble(g, m1))
     X = pd.DataFrame(cols, index=times)
     return X.replace([np.inf, -np.inf], np.nan)

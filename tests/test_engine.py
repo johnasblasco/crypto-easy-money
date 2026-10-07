@@ -4,7 +4,8 @@ import pandas as pd
 import pytest
 
 from quant.backtest import Calibrator
-from quant.engine import Engine, Evidence, ModelSpecialist, TrendSpecialist, consensus, regime_snapshot
+from quant.engine import (Engine, EventSpecialist, Evidence, ModelSpecialist, TrendSpecialist, consensus,
+                          regime_snapshot)
 from quant.live import data_health
 
 from test_quant_harness import synthetic_m1
@@ -45,7 +46,8 @@ def artifact(status="VALIDATED", p=0.9, margin=0.0, families=("cal",), decision=
 def m1():
     df = synthetic_m1(days=60)
     # Make the series end "now" so freshness checks pass.
-    shift = pd.Timestamp.now(tz="UTC").floor("min") - df.index[-1]
+    # End on an hour boundary so the 1h decision time equals the last bar (inside the entry window).
+    shift = pd.Timestamp.now(tz="UTC").floor("h") - df.index[-1]
     df.index = df.index + shift
     return df
 
@@ -169,3 +171,62 @@ def test_consensus_insufficient_data_is_no_trade():
 def test_consensus_passes_through_validated_trade():
     c = consensus([_sig("a", "LONG", "UP"), _sig("daily_trend", "FLAT", "DOWN", status="RISK_OVERLAY", exposure=0.0)])[0]
     assert c["verdict"] == "LONG" and c["agreement"] == "conflict"
+
+
+def capitulation_m1():
+    """Fresh synthetic frame whose last closed bar completes a forced, one-sided sell-off."""
+    df = synthetic_m1(days=45, seed=3)
+    df.index = df.index + (pd.Timestamp.now(tz="UTC").floor("min") - df.index[-1])
+    last60 = df.index[-60:]
+    df.loc[last60, "taker_buy_base"] = df.loc[last60, "volume"] * 0.05
+    df.loc[last60, "taker_buy_quote"] = df.loc[last60, "taker_buy_base"] * df.loc[last60, "close"]
+    prev = df["close"].iloc[-2]
+    new = prev * 0.94
+    df.iloc[-1, df.columns.get_loc("open")] = prev
+    df.iloc[-1, df.columns.get_loc("high")] = prev
+    df.iloc[-1, df.columns.get_loc("close")] = new
+    df.iloc[-1, df.columns.get_loc("low")] = new * 0.999
+    df.iloc[-1, df.columns.get_loc("quote_volume")] = df["volume"].iloc[-1] * new
+    df.iloc[-1, df.columns.get_loc("taker_buy_quote")] = df["taker_buy_base"].iloc[-1] * new
+    return df
+
+
+def event_artifact(status="VALIDATED"):
+    return {"kind": "event", "name": "capitulation", "W": 60, "k": 4.0, "h": 60, "cost": "spot_taker",
+            "symbols": ["SOLUSDT"], "evidence": {"status": status, "summary": "test", "ev_bps": 20.0},
+            "trade_sigma": 0.02}
+
+
+def test_event_specialist_trades_fresh_validated_event():
+    m = capitulation_m1()
+    sig = EventSpecialist(event_artifact()).evaluate("SOLUSDT", m, m.index[-1] + pd.Timedelta(seconds=20))
+    assert sig.action == "LONG" and sig.view == "UP"
+
+
+def test_event_specialist_unvalidated_is_informational():
+    m = capitulation_m1()
+    sig = EventSpecialist(event_artifact("NOT_VALIDATED")).evaluate("SOLUSDT", m, m.index[-1] + pd.Timedelta(seconds=20))
+    assert sig.action == "NO TRADE" and sig.view == "UP"
+    assert any("informational" in r for r in sig.reasons)
+
+
+def test_event_specialist_never_trades_stale_event():
+    m = capitulation_m1()
+    sig = EventSpecialist(event_artifact()).evaluate("SOLUSDT", m, m.index[-1] + pd.Timedelta(minutes=5))
+    assert sig.action == "NO TRADE" and any("stale" in r for r in sig.reasons)
+
+
+def test_event_specialist_outside_universe_and_quiet_market():
+    m = capitulation_m1()
+    spec = EventSpecialist(event_artifact())
+    assert spec.evaluate("BTCUSDT", m, m.index[-1]).action == "NO TRADE"
+    quiet = m.iloc[:-1]
+    sig = spec.evaluate("SOLUSDT", quiet, quiet.index[-1] + pd.Timedelta(seconds=20))
+    assert sig.action == "NO TRADE" and sig.view is None
+
+
+def test_model_signal_outside_entry_window_is_no_trade(m1):
+    spec = ModelSpecialist(artifact(p=0.9))
+    sig = spec.evaluate("BTCUSDT", m1, m1.index[-1] + pd.Timedelta(minutes=30))
+    assert sig.action == "NO TRADE" and sig.view == "UP"
+    assert any("entry window has passed" in r for r in sig.reasons)

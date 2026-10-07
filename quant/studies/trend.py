@@ -34,8 +34,8 @@ DONCHIAN = (10, 20, 30, 60, 90)
 PASTRET = (7, 14, 28, 56)
 
 
-def daily_bars(symbol: str) -> pd.DataFrame:
-    m1 = m1_frame(symbol)
+def daily_bars(symbol: str, m1: pd.DataFrame | None = None) -> pd.DataFrame:
+    m1 = m1_frame(symbol) if m1 is None else m1
     d = resample(m1, "1D")
     full = pd.date_range(d.index[0], d.index[-1], freq="1D", tz="UTC")
     d = d.reindex(full)

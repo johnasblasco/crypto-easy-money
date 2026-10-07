@@ -139,9 +139,27 @@ class ModelSpecialist:
         ev = self.evidence
         self.health = SignalHealth(self.name, mu0=(ev.ev_bps or 0) / 1e4, sigma=artifact.get("trade_sigma", 0.01))
 
+    ENTRY_WINDOW = pd.Timedelta(minutes=2)   # research entered 1 minute after each decision time
+
+    @staticmethod
+    def refresh_fng(max_age_h: float = 12.0) -> None:
+        """Keep the Fear & Greed file fresh for live use (stale values become NaN -> NO TRADE)."""
+        import time as _time
+
+        from .data import FNG_PATH, fetch_fng
+
+        try:
+            if not FNG_PATH.exists() or _time.time() - FNG_PATH.stat().st_mtime > max_age_h * 3600:
+                fetch_fng()
+        except Exception:
+            pass
+
     def evaluate(self, symbol: str, m1: pd.DataFrame, now: pd.Timestamp, others: dict | None = None) -> Signal:
         from .experiment import ex_ante_sigma
         from .backtest import expected_edge
+
+        if "fng" in self.a["families"]:
+            self.refresh_fng()
 
         grid = pd.Timedelta(minutes=self.horizon_min)
         t = now.floor(f"{self.horizon_min}min")
@@ -187,12 +205,78 @@ class ModelSpecialist:
                 pos = int(positions_from_ev(np.array([p]), np.array([sig]), np.array([rt]), margin,
                                             self.cost.allow_short)[0])
                 hurdle = f"edge > cost + margin ({(rt + margin) * 1e4:.1f}bp)"
-            if pos != 0:
-                action = "LONG" if pos > 0 else "SHORT"
-            else:
+            if pos == 0:
                 reasons.append(f"decision rule not met: {hurdle}")
+            elif now - t > self.ENTRY_WINDOW:
+                reasons.append(f"decision at {t:%Y-%m-%d %H:%M} UTC was {'LONG' if pos > 0 else 'SHORT'}, but its entry "
+                               f"window has passed (research entered 1 minute after the decision); next decision {nxt}")
+            else:
+                action = "LONG" if pos > 0 else "SHORT"
         return Signal(action=action, confidence=round(conf, 4), expected_edge_bps=round(edge * 1e4, 2),
                       cost_bps=round(rt * 1e4, 2), view="UP" if p >= 0.5 else "DOWN", reasons=reasons, **base)
+
+
+class EventSpecialist:
+    """Sparse event rule: flow-driven capitulation reversal (buy after a forced, one-sided sell-off).
+
+    Fires when the last closed 1m bar completes an event: a ``W``-minute move of at
+    least ``k`` ex-ante sigmas, in the direction of the taker imbalance, with that
+    imbalance in the top 20% of the trailing 30 days. Research entered on the next
+    minute, so an event older than ``MAX_EVENT_AGE`` is stale and never traded.
+    """
+
+    MAX_EVENT_AGE = pd.Timedelta(seconds=90)
+    LOOKBACK = pd.Timedelta(days=40)       # sigma (1-day halflife) + 30-day imbalance percentile
+
+    def __init__(self, artifact: dict):
+        self.a = artifact
+        self.name = artifact["name"]
+        self.h = int(artifact["h"])
+        self.horizon = f"{self.h // 60}h" if self.h >= 60 else f"{self.h}m"
+        self.evidence = Evidence(**artifact["evidence"])
+        self.cost = COST_MODELS[artifact["cost"]]
+        ev = self.evidence
+        self.health = SignalHealth(self.name, mu0=(ev.ev_bps or 0) / 1e4, sigma=artifact.get("trade_sigma", 0.01))
+
+    def evaluate(self, symbol: str, m1: pd.DataFrame, now: pd.Timestamp) -> Signal:
+        from .events import Bars, select
+        from .studies.event_hypotheses import h_flow_driven_reversal
+
+        base = dict(symbol=symbol, specialist=self.name, horizon=self.horizon,
+                    evidence=asdict(self.evidence), health=self.health.snapshot())
+        if symbol not in self.a["symbols"]:
+            return Signal(action="NO TRADE", as_of=str(now), reasons=["outside this specialist's tested universe"], **base)
+        tail = m1[m1.index > m1.index[-1] - self.LOOKBACK]
+        b = Bars(tail)
+        sig = h_flow_driven_reversal(b, int(self.a["W"]), float(self.a["k"]))
+        if not self.cost.allow_short:
+            sig = np.where(sig > 0, sig, 0)
+        kept = select(sig, cooldown=self.h)
+        last_t = tail.index[-1]
+        recent = [i for i in kept if tail.index[i] > last_t - pd.Timedelta(minutes=self.h)]
+        reasons = []
+        view = None
+        action = "NO TRADE"
+        if not len(recent):
+            reasons.append("no capitulation event in the last holding window")
+        else:
+            i = recent[-1]
+            age = now - tail.index[i]
+            view = "UP" if sig[i] > 0 else "DOWN"
+            reasons.append(f"capitulation event at {tail.index[i]:%H:%M} UTC ({age.total_seconds() / 60:.0f} min ago): "
+                           f"{self.a['W']}m move >= {self.a['k']:g} sigma with one-sided taker flow")
+            if i != len(tail) - 1 or age > self.MAX_EVENT_AGE:
+                reasons.append("event is stale: research entered within 1 minute -> not tradeable now")
+            elif self.evidence.status != "VALIDATED":
+                reasons.append("specialist did not pass the pre-registered validation -> informational only")
+            elif not self.health.active:
+                reasons.append(f"specialist disabled by health monitor: {self.health.reason}")
+            else:
+                action = "LONG" if sig[i] > 0 else "SHORT"
+        rt = self.cost.round_trip(symbol) + self.cost.holding(self.h)
+        return Signal(action=action, as_of=str(last_t), view=view, cost_bps=round(rt * 1e4, 2),
+                      expected_edge_bps=self.evidence.ev_bps, reasons=reasons,
+                      next_decision=(last_t + pd.Timedelta(minutes=1)).isoformat(), **base)
 
 
 # ---------------------------------------------------------------- the engine
@@ -311,5 +395,6 @@ def load_specialists(engine_dir: Path = ENGINE_DIR) -> list:
     if trend_ev.exists():
         specs.append(TrendSpecialist(Evidence(**json.loads(trend_ev.read_text()))))
     for path in sorted(engine_dir.glob("*.joblib")):
-        specs.append(ModelSpecialist(joblib.load(path)))
+        art = joblib.load(path)
+        specs.append(EventSpecialist(art) if art.get("kind") == "event" else ModelSpecialist(art))
     return specs

@@ -332,3 +332,20 @@ def test_trend_daily_bars_keep_partial_outage_days():
     full.loc[full["gap_frac"] >= 0.999, "close"] = np.nan
     outage_day = full[(full["gap_frac"] > 0.2) & (full["gap_frac"] < 0.4)]
     assert len(outage_day) == 1 and outage_day["close"].notna().all()
+
+
+def test_trend_ensemble_feature_is_point_in_time():
+    """The daily trend-ensemble feature at T depends only on days completed by T."""
+    m = synthetic_m1(days=130, seed=5)
+    times = decision_times(m, "4320min")
+    base = F.build(m, times, "AAAUSDT", families=["ens"])
+    assert base["ens__trend_ensemble"].notna().sum() >= 5          # not vacuous
+    cut = times[-6]
+    altered = m.copy()
+    after = altered.index > cut
+    for c in ["open", "high", "low", "close"]:
+        altered.loc[after, c] *= 0.5
+    pert = F.build(altered, times, "AAAUSDT", families=["ens"])
+    before = base.index <= cut
+    pd.testing.assert_frame_equal(base[before], pert[before])
+    assert ((base["ens__trend_ensemble"] >= 0) & (base["ens__trend_ensemble"] <= 1) | base["ens__trend_ensemble"].isna()).all()

@@ -79,13 +79,20 @@ def summarize(ev: pd.DataFrame, fee_side: float, funding: float, allow_short: bo
     fund = np.where(ev["dir"] > 0, funding, 0.0)
     net_side = ev["ret_side"] - 2 * (fee_side + OWN_IMPACT) - fund
     m, p, lo = day_bootstrap(ev.assign(net=net_side), "net")
+    # Day-level series (events on the same day are one correlated bet) for the deflated Sharpe.
+    day = net_side.groupby(ev["ts"].dt.floor("D")).mean()
+    from scipy import stats as _st
+
+    day_stats = {"sr_day": float(day.mean() / day.std(ddof=1)) if len(day) > 2 else float("nan"),
+                 "n_day": int(len(day)), "skew_day": float(_st.skew(day)),
+                 "kurt_day": float(_st.kurtosis(day, fisher=False))}
     by_year = {int(y): {"n": int(len(g)), "net_bps": round(float(net_side[g.index].mean() * 1e4), 1)}
                for y, g in ev.groupby(ev["ts"].dt.year)}
     return {"n": int(len(ev)), "days": int(ev["ts"].dt.floor("D").nunique()),
             "gross_vwap_bps": float(ev["ret_vwap"].mean() * 1e4), "gross_side_bps": float(ev["ret_side"].mean() * 1e4),
             "fill_drag_bps": float((ev["ret_vwap"] - ev["ret_side"]).mean() * 1e4),
             "net_side_bps": float(m * 1e4), "p_net": p, "net_p5_bps": float(lo * 1e4),
-            "median_entry_spread_bps": float(ev["spread_entry"].median() * 1e4), "by_year": by_year,
+            "median_entry_spread_bps": float(ev["spread_entry"].median() * 1e4), **day_stats, "by_year": by_year,
             "positive_years": f"{sum(1 for v in by_year.values() if v['n'] >= 20 and v['net_bps'] > 0)}/"
                               f"{sum(1 for v in by_year.values() if v['n'] >= 20)}"}
 

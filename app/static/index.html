@@ -107,6 +107,29 @@
         </dl>
       </section>
 
+      <section class="card planner" id="planner-card">
+        <h2>Trade planner</h2>
+        <p class="note planner-intro">Set your levels like a long/short position on TradingView. The app replays the same
+          trade from every past candle of this coin and shows how it went after fees.</p>
+        <form id="plan-form" class="plan-form" autocomplete="off" novalidate>
+          <label class="tp">Take profit <input id="plan-target" type="number" step="any" min="0" inputmode="decimal"></label>
+          <label class="entry">Entry <input id="plan-entry" type="number" step="any" min="0" inputmode="decimal" placeholder="live price"></label>
+          <label class="sl">Stop loss <input id="plan-stop" type="number" step="any" min="0" inputmode="decimal"></label>
+          <label>Side (for suggestions)
+            <select id="plan-side"><option value="long">Long</option><option value="short">Short</option></select>
+          </label>
+          <label>Max hold (candles) <input id="plan-bars" type="number" min="1" max="500" step="1" value="48"></label>
+          <label>Account size <input id="plan-account" type="number" step="any" min="0" inputmode="decimal" placeholder="optional"></label>
+          <label>Risk per trade % <input id="plan-risk" type="number" step="any" min="0.01" max="100" value="1"></label>
+          <div class="plan-buttons">
+            <button type="button" class="btn" id="plan-suggest">Suggest levels</button>
+            <button type="submit" class="btn primary">Check trade</button>
+            <button type="button" class="btn" id="plan-clear">Clear</button>
+          </div>
+        </form>
+        <div id="plan-result" class="plan-result" aria-live="polite"></div>
+      </section>
+
       <section class="card">
         <h2>Indicators</h2>
         <table class="indicators">

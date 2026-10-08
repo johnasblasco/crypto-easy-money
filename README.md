@@ -285,11 +285,36 @@ frontend (vendored under `app/static/vendor`, Apache-2.0). It shows:
   out-of-sample candles are marked: the held-out test set plus candles that
   arrived after training. "Recent hit rate" is computed from these.
 - The model comparison table
+- A **trade planner** (see below)
 
 The dashboard refreshes every minute. Settings come from environment variables:
 - `DATA_SOURCE` — `binance`, `csv` or `synthetic`
 - `CANDLES` — number of candles on the chart
 - `MODEL_PATH` — trained model to load
+- `PLAN_HISTORY` — candles the trade planner replays a plan over (default 2000)
+
+**Trade planner.** Like a long/short position on TradingView, you can set an
+entry, a take-profit and a stop-loss, or press **Suggest levels** for a
+template (stop 1.5 × ATR away, target at twice that distance). The levels are
+drawn on the chart. The levels alone don't predict anything, so the planner
+reports these numbers with them:
+
+- **Reward/risk and the break-even win rate after fees.** A 2:1 target needs
+  to come first about 1 time in 3 just to cover the payoff, plus fees.
+- **A replay on this coin's own history.** The same % distances are tested from
+  every past candle (about 2000). It shows how often the target came first, how
+  often the stop came first, and how often neither was hit within the max hold.
+  It also gives the average result after fees, with a likely range.
+- **A comparison with no levels.** It enters at the same moments and simply
+  sells after the same number of candles. If the levels didn't beat that,
+  any profit came from the trend in that period.
+- **Position size.** Enter an account size and a risk %. The planner shows how
+  much to buy so that hitting the stop loses exactly that share, fees included.
+  It warns if that size would need leverage.
+
+The replay is cautious where candles can't tell what happened:
+- If the target and the stop both fall inside one candle, the trade counts as a loss.
+- If a candle opens past the stop (a gap), the trade fills at that candle's open.
 
 ### 6. Edge check — would it have made money?
 Every training run ends with a plain-language verdict, shown at the top of the
@@ -424,6 +449,7 @@ cryptopredict/
   experiments.py many tokens x intervals x horizons, with multiple-comparison correction
   scanner.py     live BUY/AVOID/WAIT signals + Telegram/Discord alerts
   predict.py     next-candle prediction + CLI
+  planner.py     entry / take-profit / stop-loss replay, break-even and position sizing
 quant/           research harness and signal engine (see docs/RESEARCH_REPORT.md)
   data.py        1m kline download/load, quality report, Fear & Greed
   labels.py      next-minute VWAP fills, forward returns
@@ -437,7 +463,7 @@ quant/           research harness and signal engine (see docs/RESEARCH_REPORT.md
   train_engine.py frozen candidates, one-time holdout evaluation
   studies/       every experiment, including the ones that failed
 app/
-  server.py      FastAPI backend (/api/dashboard, /api/scanner, /api/engine)
+  server.py      FastAPI backend (/api/dashboard, /api/scanner, /api/plan, /api/engine)
   static/        dashboard HTML/CSS/JS + vendored chart library
 tests/           unit and end-to-end tests
 ```

@@ -26,6 +26,9 @@
   // Which model the chart shows: null = main model, else an experiments config like "ETHUSDT_4h_h1".
   let currentConfig = decodeURIComponent(location.hash.slice(1)) || null;
   let lastScan = null;
+  // Trade planner: the last checked plan and its entry / take-profit / stop-loss lines on the chart.
+  let lastPlan = null;
+  let planLines = [];
 
   function chartOptions(height, attribution) {
     return {
@@ -63,6 +66,17 @@
     const down = css("--down");
     const candles = price.addCandlestickSeries({
       upColor: up, downColor: down, borderUpColor: up, borderDownColor: down, wickUpColor: up, wickDownColor: down,
+    });
+    // Stretch the price scale so a planned take-profit or stop-loss stays in view.
+    candles.applyOptions({
+      autoscaleInfoProvider: (original) => {
+        const r = original();
+        if (!r || !lastPlan) return r;
+        const { entry, stop, target } = lastPlan.plan;
+        r.priceRange.minValue = Math.min(r.priceRange.minValue, entry, stop, target);
+        r.priceRange.maxValue = Math.max(r.priceRange.maxValue, entry, stop, target);
+        return r;
+      },
     });
     const lineOpts = { lineWidth: 2, priceLineVisible: false, lastValueVisible: false, crosshairMarkerRadius: 4 };
     const ema12 = price.addLineSeries({ ...lineOpts, color: css("--series-1") });
@@ -103,6 +117,7 @@
     ro.observe(priceEl);
 
     charts = { instances: { price, volume, rsi }, candles, ema12, ema26, vol, rsiLine, ro };
+    planLines = []; // they belonged to the old series
   }
 
   function renderLegend(c) {
@@ -412,6 +427,7 @@
     currentConfig = config;
     history.replaceState(null, "", config ? `#${config}` : location.pathname);
     if (lastScan) renderScanner(lastScan);
+    clearPlan();
     load(false);
     window.scrollTo({ top: $("price-chart").getBoundingClientRect().top + window.scrollY - 140, behavior: "smooth" });
   }
@@ -452,6 +468,7 @@
   window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
     createCharts();
     if (lastData) renderCharts(lastData, false);
+    if (lastPlan) drawPlanLines(lastPlan.plan);
   });
 
   // ------------------------------------------------------------ signal engine
@@ -535,6 +552,142 @@
       $("engine-note").textContent = `Signal engine unavailable: ${err.message}`;
     }
   }
+
+  // ------------------------------------------------------------ trade planner
+  const PLAN_TONE = {
+    "LOSES ON AVERAGE": "avoid",
+    "NO PROVEN EDGE": "wait",
+    "HELD UP IN THE PAST": "buy",
+    "NOT ENOUGH HISTORY": "none",
+  };
+  const fmtMoney = (v) => v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const fmtQty = (q) => (q >= 1000 ? q.toLocaleString(undefined, { maximumFractionDigits: 0 }) : String(Number(q.toPrecision(5))));
+  const baseAsset = (sym) => (sym.match(/^(.+?)(USDT|USDC|FDUSD|BUSD|TUSD|USD)$/) || [null, sym])[1];
+  const fmtDay = (iso) => new Date(iso).toLocaleDateString(undefined, { dateStyle: "medium" });
+
+  function drawPlanLines(plan) {
+    planLines.forEach((l) => charts.candles.removePriceLine(l));
+    planLines = [];
+    if (!plan) return;
+    const sign = plan.side === "long" ? 1 : -1;
+    const line = (price, color, title, style) =>
+      charts.candles.createPriceLine({ price, color, title, lineWidth: 2, lineStyle: style, axisLabelVisible: true });
+    planLines = [
+      line(plan.target, css("--up"), `TP ${fmtSignedPct((sign * plan.reward_pct))}`, 0),
+      line(plan.entry, css("--text-secondary"), "Entry", 2),
+      line(plan.stop, css("--down"), `SL ${fmtSignedPct(-sign * plan.risk_pct)}`, 0),
+    ];
+  }
+
+  function clearPlan() {
+    lastPlan = null;
+    if (charts) drawPlanLines(null);
+    ["plan-entry", "plan-target", "plan-stop"].forEach((id) => { $(id).value = ""; });
+    $("plan-result").innerHTML = "";
+  }
+
+  function renderPlan(r) {
+    const p = r.plan;
+    const h = r.history;
+    const tone = PLAN_TONE[r.verdict] || "none";
+    const fee = `${(r.cost_per_side * 100).toFixed(2)}% per side`;
+    let html =
+      `<div class="verdict"><span class="pill ${tone}">${esc(r.verdict)}</span>` +
+      `<span class="muted">${p.suggested ? "suggested template" : "your levels"}</span></div>` +
+      `<p><b>${p.side.toUpperCase()}</b> · reward <b>${fmtPct(p.reward_pct, 2)}</b> · risk <b>${fmtPct(p.risk_pct, 2)}</b>` +
+      ` · reward/risk <b>${p.reward_risk.toFixed(2)}</b></p>` +
+      `<p>To break even after fees (${fee}) the target must come first in <b>${fmtPct(h.breakeven_win_rate)}</b> of trades. ` +
+      `If price moved at random it would come first ${fmtPct(h.random_walk_win_rate)} of the time.</p>`;
+    if (h.win_rate != null) {
+      html +=
+        `<p>Replayed from <b>${h.starts.toLocaleString()}</b> past ${esc(r.interval)} candles ` +
+        `(${fmtDay(h.period[0])} → ${fmtDay(h.period[1])}, about ${Math.round(h.independent_trades)} independent trades):</p>` +
+        `<dl class="meta">` +
+        `<dt class="up">Target first</dt><dd>${fmtPct(h.win_rate)}</dd>` +
+        `<dt class="down">Stop first</dt><dd>${fmtPct(h.loss_rate)}</dd>` +
+        `<dt>Neither in ${p.max_bars} candles</dt><dd>${fmtPct(h.timeout_rate)}</dd>` +
+        `<dt>Average after fees</dt><dd><b class="${h.avg_net >= 0 ? "up" : "down"}">${fmtSignedPct(h.avg_net)}</b> per trade</dd>` +
+        `<dt>Likely range</dt><dd>${fmtSignedPct(h.avg_net_low)} … ${fmtSignedPct(h.avg_net_high)}</dd>` +
+        `<dt>Same entries, no levels</dt><dd>${fmtSignedPct(h.hold_avg_net)}</dd>` +
+        `<dt>Average time in trade</dt><dd>${h.avg_bars.toFixed(1)} candles</dd>` +
+        `</dl>`;
+      if (h.timeout_rate > 0.25) {
+        html +=
+          `<p class="warn-text">In ${fmtPct(h.timeout_rate, 0)} of past trades price reached neither level within ` +
+          `${p.max_bars} candles: these levels are far apart for ${esc(r.interval)} candles. ` +
+          `Allow a longer hold or use a longer timeframe.</p>`;
+      }
+    }
+    html += `<p>${esc(r.verdict_text)}</p>`;
+    const s = r.size;
+    if (s) {
+      const base = esc(baseAsset(r.symbol));
+      html +=
+        `<p>Position size: buy <b>${fmtQty(s.quantity)} ${base}</b> (≈ ${fmtMoney(s.notional)}). ` +
+        `Stop hit: <b class="down">−${fmtMoney(s.loss_at_stop)}</b> (${fmtPct(s.risk_share, 2)} of the account). ` +
+        `Target hit: <b class="up">${s.gain_at_target >= 0 ? "+" : "−"}${fmtMoney(Math.abs(s.gain_at_target))}</b>.</p>`;
+      if (s.leverage_needed > 1) {
+        html +=
+          `<p class="warn-text">That is ${s.leverage_needed.toFixed(1)}× your account, so it needs leverage. ` +
+          `Without leverage you can buy at most ${fmtQty(s.capped_quantity)} ${base}, which loses ` +
+          `${fmtMoney(s.capped_loss_at_stop)} at the stop. A tight stop does not make a big position safe.</p>`;
+      }
+    }
+    html +=
+      `<p class="muted">The replay uses the same % distances from each past close and assumes you get filled at your entry. ` +
+      `If target and stop fall inside the same candle, it counts as a loss. Not financial advice.</p>`;
+    $("plan-result").innerHTML = html;
+  }
+
+  async function checkPlan(suggest) {
+    const params = new URLSearchParams();
+    if (currentConfig) params.set("config", currentConfig);
+    params.set("max_bars", $("plan-bars").value || "48");
+    params.set("risk_pct", $("plan-risk").value || "1");
+    if ($("plan-account").value) params.set("account", $("plan-account").value);
+    if (suggest) {
+      params.set("side", $("plan-side").value);
+    } else {
+      if (!$("plan-entry").value && lastData) $("plan-entry").value = String(lastData.prediction.price);
+      const missing = ["plan-entry", "plan-target", "plan-stop"].filter((id) => !$(id).value);
+      if (missing.length) {
+        $("plan-result").innerHTML = '<p class="warn-text">Enter a take profit and a stop loss, or press “Suggest levels”.</p>';
+        return;
+      }
+      params.set("entry", $("plan-entry").value);
+      params.set("target", $("plan-target").value);
+      params.set("stop", $("plan-stop").value);
+    }
+    $("plan-result").innerHTML = '<p class="muted">Replaying…</p>';
+    try {
+      const res = await fetch(`/api/plan?${params}`);
+      const body = await res.json();
+      if (!res.ok) throw new Error(typeof body.detail === "string" ? body.detail : res.statusText);
+      lastPlan = body;
+      const p = body.plan;
+      if (p.suggested) {
+        // Round to the chart's precision so the inputs stay readable.
+        const d = priceDigits(p.entry);
+        $("plan-entry").value = p.entry.toFixed(d);
+        $("plan-target").value = p.target.toFixed(d);
+        $("plan-stop").value = p.stop.toFixed(d);
+      }
+      $("plan-side").value = p.side;
+      drawPlanLines(p);
+      renderPlan(body);
+    } catch (err) {
+      lastPlan = null;
+      drawPlanLines(null);
+      $("plan-result").innerHTML = `<p class="warn-text">${esc(err.message)}</p>`;
+    }
+  }
+
+  $("plan-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    checkPlan(false);
+  });
+  $("plan-suggest").addEventListener("click", () => checkPlan(true));
+  $("plan-clear").addEventListener("click", clearPlan);
 
   createCharts();
   load(false);

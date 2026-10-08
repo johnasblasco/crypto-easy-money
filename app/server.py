@@ -10,6 +10,7 @@ Environment variables:
                      used by the market scanner and the per-token charts
     DATA_SOURCE      binance | csv | synthetic (default: the source used in training)
     CANDLES          candles shown on the chart (default 300)
+    PLAN_HISTORY     candles the trade planner replays a plan over (default 2000)
 """
 from __future__ import annotations
 
@@ -25,11 +26,12 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from cryptopredict.data import load_data
+from cryptopredict import planner
+from cryptopredict.data import load_data, tick_size
 from cryptopredict.features import add_features
 from cryptopredict.predict import load_bundle, predict_latest
 from cryptopredict.scanner import scan
-from cryptopredict.train import MODELS_DIR
+from cryptopredict.train import DEFAULT_FEE, MODELS_DIR
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 MODEL_PATH = Path(os.environ.get("MODEL_PATH", MODELS_DIR / "model.joblib"))
@@ -37,6 +39,7 @@ EXPERIMENTS_DIR = Path(os.environ.get("EXPERIMENTS_DIR", MODELS_DIR / "experimen
 CANDLES = int(os.environ.get("CANDLES", 300))
 # Indicators need ~50 candles of warm-up before the first chart candle.
 WARMUP = 60
+PLAN_HISTORY = int(os.environ.get("PLAN_HISTORY", 2000))
 CACHE_SECONDS = 30
 SCAN_CACHE_SECONDS = 120
 CONFIG_NAME = re.compile(r"^[A-Z0-9]{2,20}_[0-9]{1,2}[mhd]_h[0-9]{1,3}$")
@@ -169,18 +172,86 @@ def _cached(key, path: Path, ttl: float, build):
     return entry["payload"]
 
 
+def _model_path(config: str | None) -> Path:
+    if config is None:
+        return MODEL_PATH
+    if not CONFIG_NAME.match(config):
+        raise HTTPException(status_code=400, detail="Invalid config name")
+    model_path = EXPERIMENTS_DIR / config / "model.joblib"
+    if not model_path.exists():
+        raise HTTPException(status_code=404, detail=f"No trained model for {config}")
+    return model_path
+
+
 @app.get("/api/dashboard")
 def dashboard(config: str | None = None):
     """Chart data for the main model, or for one experiments model (e.g. ETHUSDT_4h_h1)."""
-    if config is None:
-        model_path = MODEL_PATH
-    else:
-        if not CONFIG_NAME.match(config):
-            raise HTTPException(status_code=400, detail="Invalid config name")
-        model_path = EXPERIMENTS_DIR / config / "model.joblib"
-        if not model_path.exists():
-            raise HTTPException(status_code=404, detail=f"No trained model for {config}")
+    model_path = _model_path(config)
     return _cached(("dashboard", str(model_path)), model_path, CACHE_SECONDS, lambda: build_dashboard(model_path))
+
+
+def _plan_market(model_path: Path) -> dict:
+    """Symbol, recent candles and per-side trading cost for the chart's coin."""
+    try:
+        bundle = load_bundle(model_path)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    source = os.environ.get("DATA_SOURCE", bundle["source"])
+    try:
+        df = load_data(source, bundle["symbol"], bundle["interval"], PLAN_HISTORY, save=False)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Could not load market data: {exc}") from exc
+    metrics_path = model_path.parent / "metrics.json"
+    metrics = json.loads(metrics_path.read_text()) if metrics_path.exists() else {}
+    cost = metrics.get("cost_per_trade")
+    if cost is None:  # models trained before the half-tick spread was charged
+        cost = metrics.get("fee", DEFAULT_FEE)
+        tick = tick_size(bundle["symbol"]) if source == "binance" else None
+        if tick:
+            cost += 0.5 * tick / float(df["close"].median())
+    return {"symbol": bundle["symbol"], "interval": bundle["interval"], "source": source, "df": df, "cost": cost}
+
+
+@app.get("/api/plan")
+def trade_plan(config: str | None = None, entry: float | None = None, stop: float | None = None,
+               target: float | None = None, side: str = "long", max_bars: int = 48,
+               account: float | None = None, risk_pct: float = 1.0):
+    """Replay an entry / stop-loss / take-profit plan over the coin's recent history.
+
+    Without levels, suggests a volatility-scaled template (stop 1.5 ATR away, target at 2R).
+    """
+    model_path = _model_path(config)
+    levels = (entry, stop, target)
+    if any(v is None for v in levels) and not all(v is None for v in levels):
+        raise HTTPException(status_code=400, detail="Give entry, stop and target together, or none to get a suggestion.")
+    if side not in ("long", "short"):
+        raise HTTPException(status_code=400, detail="side must be long or short")
+    if not 1 <= max_bars <= planner.MAX_BARS_LIMIT:
+        raise HTTPException(status_code=400, detail=f"max_bars must be between 1 and {planner.MAX_BARS_LIMIT}")
+    if account is not None and not (math.isfinite(account) and account > 0):
+        raise HTTPException(status_code=400, detail="account must be a positive amount")
+    if not (math.isfinite(risk_pct) and 0 < risk_pct <= 100):
+        raise HTTPException(status_code=400, detail="risk_pct must be between 0 and 100")
+
+    market = _cached(("plan", str(model_path)), model_path, CACHE_SECONDS, lambda: _plan_market(model_path))
+    df = market["df"]
+    suggested = entry is None
+    if suggested:
+        levels = planner.suggest(df, side)
+        entry, stop, target = levels["entry"], levels["stop"], levels["target"]
+    try:
+        result = planner.plan(df, entry, stop, target, max_bars, market["cost"], account, risk_pct / 100)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    result["plan"]["suggested"] = suggested
+    return _json_safe({
+        "symbol": market["symbol"],
+        "interval": market["interval"],
+        "source": market["source"],
+        "price": float(df["close"].iloc[-1]),
+        "as_of": df["timestamp"].iloc[-1].isoformat(),
+        **result,
+    })
 
 
 @app.get("/api/scanner")

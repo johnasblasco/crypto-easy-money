@@ -79,6 +79,40 @@ def test_dashboard_api(trained, monkeypatch):
     assert client.get("/").status_code == 200
 
 
+def test_trade_plan_api(trained, monkeypatch):
+    from app import server
+
+    out, metrics = trained
+    monkeypatch.setattr(server, "MODEL_PATH", out / "model.joblib")
+    server._cache.clear()
+    client = TestClient(server.app)
+
+    suggested = client.get("/api/plan").json()
+    plan = suggested["plan"]
+    assert plan["suggested"] and plan["side"] == "long"
+    assert plan["stop"] < plan["entry"] < plan["target"]
+    assert plan["reward_risk"] == pytest.approx(2)
+    assert suggested["cost_per_side"] == pytest.approx(metrics["cost_per_trade"])
+    assert suggested["history"]["starts"] == server.PLAN_HISTORY - plan["max_bars"]
+    assert suggested["verdict"] in {"LOSES ON AVERAGE", "NO PROVEN EDGE", "HELD UP IN THE PAST", "NOT ENOUGH HISTORY"}
+    assert suggested["size"] is None
+
+    price = suggested["price"]
+    resp = client.get("/api/plan", params={"entry": price, "stop": price * 1.01, "target": price * 0.97,
+                                           "max_bars": 24, "account": 1000, "risk_pct": 2})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["plan"]["side"] == "short" and not body["plan"]["suggested"]
+    assert body["size"]["loss_at_stop"] == pytest.approx(20)
+    h = body["history"]
+    assert h["win_rate"] + h["loss_rate"] + h["timeout_rate"] == pytest.approx(1)
+
+    for bad in ({"entry": price}, {"entry": price, "stop": price * 1.01, "target": price * 1.02},
+                {"max_bars": 0}, {"risk_pct": 0}, {"account": -5}, {"side": "sideways"}):
+        assert client.get("/api/plan", params=bad).status_code == 400, bad
+    assert client.get("/api/plan", params={"config": "NOPE_1h_h1"}).status_code == 404
+
+
 def test_dashboard_without_model(tmp_path, monkeypatch):
     from app import server
 

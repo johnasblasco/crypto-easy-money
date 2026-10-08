@@ -350,7 +350,8 @@
     $("scan-time").textContent = rows.length ? `· updated ${fmtTime(data.scanned_at)}` : "";
     if (!rows.length) {
       $("scanner").innerHTML =
-        '<tr><td colspan="8">No token models yet. Run <code>python -m cryptopredict.experiments</code> to train and validate them.</td></tr>';
+        '<tr><td colspan="8">No token models yet. Train and validate them with <code>python -m cryptopredict.experiments</code> ' +
+        '(in Docker: <code>docker compose run --rm web python -m cryptopredict.experiments --jobs 2</code>), then refresh.</td></tr>';
       $("scanner-note").textContent = "";
       return;
     }

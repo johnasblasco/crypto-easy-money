@@ -15,7 +15,11 @@ Usage:
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import time
 from dataclasses import asdict
+from pathlib import Path
 
 import joblib
 import numpy as np
@@ -153,11 +157,34 @@ def _meme_evidence() -> dict | None:
     return {"symbols": tested, "note": note}
 
 
-def write_trend_evidence() -> Evidence:
-    ENGINE_DIR.mkdir(parents=True, exist_ok=True)
+def write_trend_evidence(out_dir: Path | None = None) -> Evidence:
+    out_dir = out_dir or ENGINE_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
     ev = trend_evidence()
-    (ENGINE_DIR / "trend_evidence.json").write_text(json.dumps(asdict(ev), indent=2, default=str))
+    (out_dir / "trend_evidence.json").write_text(json.dumps(asdict(ev), indent=2, default=str))
     return ev
+
+
+def _replace(src: Path, dst: Path, tries: int = 10) -> None:
+    for i in range(tries):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:   # Windows: the dashboard may be reading a file in it right now
+            if i == tries - 1:
+                raise
+            time.sleep(1)
+
+
+def publish(staging: Path, target: Path | None = None) -> None:
+    """Swap a finished build in, so the dashboard sees the old engine or the new one, never a mix."""
+    target = target or ENGINE_DIR
+    old = target.with_name(target.name + ".old")
+    shutil.rmtree(old, ignore_errors=True)
+    if target.exists():
+        _replace(target, old)
+    _replace(staging, target)
+    shutil.rmtree(old, ignore_errors=True)
 
 
 # ------------------------------------------------------------------ models
@@ -360,20 +387,27 @@ INFORMATIONAL: list[dict] = [
 
 
 def main():
-    ev = write_trend_evidence()
+    # Build into a staging folder and swap it in at the end: a crash or a dashboard
+    # refresh mid-training never sees a half-built engine, and the previous one survives.
+    staging = ENGINE_DIR.with_name(ENGINE_DIR.name + ".new")
+    shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True)
+    ev = write_trend_evidence(staging)
     print("trend:", ev.status, "|", ev.summary, flush=True)
     for c in CANDIDATES:
         res = evaluate_candidate(c)
-        joblib.dump(res["artifact"], ENGINE_DIR / f"{c['name']}.joblib")
+        joblib.dump(res["artifact"], staging / f"{c['name']}.joblib")
         print(c["name"], res["evidence"]["status"], "|", res["evidence"]["summary"], flush=True)
     for c in EVENT_CANDIDATES:
         res = evaluate_event_candidate(c)
-        joblib.dump(res["artifact"], ENGINE_DIR / f"{c['name']}.joblib")
+        joblib.dump(res["artifact"], staging / f"{c['name']}.joblib")
         print(c["name"], res["evidence"]["status"], "|", res["evidence"]["summary"], flush=True)
     for c in INFORMATIONAL:
         art = informational_model(c, c["research_summary"])
-        joblib.dump(art, ENGINE_DIR / f"{c['name']}.joblib")
+        joblib.dump(art, staging / f"{c['name']}.joblib")
         print(c["name"], "NOT_VALIDATED (informational)", flush=True)
+    publish(staging)
+    print(f"engine written to {ENGINE_DIR}", flush=True)
 
 
 if __name__ == "__main__":

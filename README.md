@@ -52,16 +52,16 @@ Any Binance spot pair works; pass its symbol:
 python -m cryptopredict.train --source binance --symbol PEPEUSDT --interval 1h
 python -m cryptopredict.experiments --symbols PEPEUSDT SHIBUSDT BONKUSDT WIFUSDT --intervals 1h 4h   # for the scanner
 python -m quant.data download --symbols PEPEUSDT SHIBUSDT BONKUSDT   # 1-minute history for the research engine
-ENGINE_SYMBOLS=BTCUSDT,ETHUSDT,PEPEUSDT,SHIBUSDT uvicorn app.server:app   # coins on the engine card
+ENGINE_SYMBOLS=BTCUSDT,ETHUSDT,PEPEUSDT,SHIBUSDT uvicorn app.server:app   # coins on the engine card (to keep the model specialists' inputs, list all 16 defaults plus the memes)
 ```
 
 The engine's trend overlay only sizes coins it has been tested on. To test it on
 meme coins, download their history, then run the meme study and retrain the
-engine. The full list of 21 memes is `MEMES` in `quant/studies/meme_coins.py`.
+engine. The 22 meme coins are listed in `MEMES` in `quant/studies/meme_coins.py`; DOGE is one of them and is also among the 16 main coins.
 
 ```bash
 python -m quant.studies.meme_coins     # tests the overlay on every downloaded meme coin
-python -m quant.train_engine           # the engine then covers the coins that were tested
+python -m quant.build_engine --retrain # the engine then covers the coins that were tested
 ```
 
 In Docker, put `docker compose run --rm web` in front of the commands, and set `ENGINE_SYMBOLS` in `.env`.
@@ -80,7 +80,9 @@ What is different about meme coins (measured on Binance data, October 2026):
   - Its worst drawdown was −28%, versus −94% for buy & hold.
   - Over the last year it lost 3.6%, while buy & hold lost 51%.
 
-  It limits losses; it does not make memes profitable. The engine applies it only to the 37 coins it was tested on and says so for any other coin.
+  It limits losses; it does not make memes profitable. The engine applies the overlay only to coins it was tested on, and says so for any other coin:
+  - a plain `quant.build_engine` covers the 16 main coins;
+  - after the meme study and a retrain (below), it covers 37: the 16 main coins and 21 other memes.
 - **No short-term meme trading signal was validated.**
 
 ## Run with Docker
@@ -133,18 +135,38 @@ updates.
 `git pull` or after editing any `.py` file:
 
 ```bash
-docker compose build && docker compose up -d
+docker compose build
+docker compose up -d
 ```
 
 Notes:
 - **Network access:** the dashboard listens on this computer only (`127.0.0.1`), because it has no login. To reach it from other devices, set `BIND_ADDR=0.0.0.0` in `.env`. Do that only on a network you trust.
-- **Signal engine:** the dashboard's engine card needs `models/engine/`, made by `python -m quant.train_engine` after the research studies (see [Research engine](#research-engine--quant)). Until then it says "not trained yet".
-  - Its first load after each start syncs every coin from Binance and can take a few minutes.
+- **Signal engine:** the dashboard's engine card needs `models/engine/`. Until it exists, the card says "not built yet". Build it with one command (see [Research engine](#research-engine--quant)):
+
+  ```bash
+  git pull                                                        # the build command is new:
+  docker compose build                                            #   update the code and the image first
+  docker compose stop web                                         # frees memory for the build
+  docker compose run --rm web python -m quant.build_engine        # a few hours; rerun to resume after an error
+  docker compose up -d                                            # after it prints "Engine built"
+  ```
+
+  - **Progress:** the build also writes to `data/logs/build_engine.log`. Follow it with `tail -f data/logs/build_engine.log`, or in PowerShell with `Get-Content data\logs\build_engine.log -Wait -Tail 20`.
+  - **Closing the terminal doesn't stop the build.** It keeps running in its container. Check with `docker ps`, and stop it with `docker stop <container id>`.
+  - **Getting your terminal back:** start the build with `docker compose run -d --rm web python -m quant.build_engine`. Then run `docker compose up -d` only once the log ends with "Engine built" or "!! Step failed".
+  - **Running it twice:** a second build refuses to start while one is running.
+  - **First load:** the engine's first load after each start syncs every coin from Binance and can take a few minutes.
+  - **Expect NO TRADE for every coin.** No trading signal passed the holdout test. Only the trend overlay passed, and only as a risk overlay, so the card shows its exposure as position-size guidance, never as a trade.
 - **Memory:**
   - the dashboard needs about 1–2 GB, or about 3 GB once the engine is trained;
-  - `quant.data download`, the research studies and `quant.train_engine` need about 8 GB.
+  - `quant.build_engine`, `quant.train_engine` and any `quant.studies.*` command need about 8 GB. Stop the dashboard first (`docker compose stop web`).
 
-  Raise Docker Desktop's limit (Settings → Resources) before running those.
+  Give Docker Desktop at least 10 GB before running those:
+  - Mac, or Windows with the Hyper-V backend: Settings → Resources.
+  - Windows with WSL 2: WSL gets half your RAM by default. If that is less than 10 GB:
+    1. add `memory=10GB` under `[wsl2]` in `%UserProfile%\.wslconfig` (never lower a larger value already there);
+    2. quit Docker Desktop and run `wsl --shutdown`;
+    3. start Docker Desktop again.
 - **File ownership on Linux:**
   - **Docker Engine:** the container runs as an unprivileged user with uid 1000. If your user id differs (`id -u`), set `HOST_UID` and `HOST_GID` in `.env` and rebuild, so files written to `data/` and `models/` stay yours.
   - **Rootless Docker, or Docker Desktop for Linux:** set both to `0` instead, because container root maps to your own user there.
@@ -161,25 +183,46 @@ pre-registered out-of-sample test after realistic costs, its data is fresh, and
 a live health monitor hasn't disabled it. The full study, including what
 failed, is in **[docs/RESEARCH_REPORT.md](docs/RESEARCH_REPORT.md)**.
 
+**Build the engine (one command).** It runs only the steps the engine needs, skips
+the ones already done (so you can rerun it after an error), and logs to
+`data/logs/build_engine.log`. Expect a few hours, about 3 GB of downloads and
+about 8 GB of memory:
+
 ```bash
-# 1. Data: 1-minute Binance klines for 16 coins since 2020 (~3 GB, resumable)
-python -m quant.data download
-python -m quant.data check                 # gaps, outages, bad bars
-
-# 2. Research studies (each writes data/results/<study>.json; research period only)
-python -m quant.studies.trend              # daily trend vs vol-targeted hold vs random timing
-python -m quant.studies.intraday_conversion
-python -m quant.studies.event_hypotheses   # sweeps, cascades, flow reversals, breakouts...
-python -m quant.studies.execution_realism  # aggressor-side fills, state-dependent spreads
-python -m quant.studies.daily_panel 3      # pooled daily ML panel, 3-day horizon
-python -m quant.report                     # collate results into markdown tables
-
-# 3. Freeze candidates, evaluate each ONCE on the locked holdout, write models/engine/
-python -m quant.train_engine
-
-# 4. Dashboard: the "Signal engine" card shows a verdict per coin
-uvicorn app.server:app
+python -m quant.build_engine --dry-run     # what it will do, and what is already done
+python -m quant.build_engine               # Docker: docker compose run --rm web python -m quant.build_engine
+python -m quant.build_engine --refresh     # later: update every coin to today, then retrain
 ```
+
+It runs, in order:
+1. `quant.data download`: 1-minute Binance klines for the 16 coins since 2020. Only missing coins are downloaded. To bring coins you already have up to date, use `--refresh`.
+2. `quant.studies.execution_realism`: the event rule's research statistics. `train_engine` needs them.
+3. `quant.studies.intraday_conversion`, `daily_panel 1` and `daily_panel 3`: these record every research trial in the ledger.
+   - `train_engine` deflates each model's Sharpe ratio over those trials.
+   - Without them, the models can't pass and are marked NOT_VALIDATED.
+4. `quant.train_engine`: freezes the candidates, evaluates each **once** on the locked holdout, and writes `models/engine/`.
+
+`train_engine` builds into `models/engine.new/` and swaps the folder in at the end. A running dashboard therefore keeps showing the previous engine (or "not built yet") until the build is complete. It then loads the new engine on its next refresh, with no restart.
+
+More options:
+- `--retrain` reruns only `train_engine`.
+- `--refresh` first brings every coin's history up to today and clears the feature caches, then retrains. The research studies use data from before the holdout only, so they stay valid.
+
+**More research studies.** Every other study in `quant/studies/` feeds
+[docs/RESEARCH_REPORT.md](docs/RESEARCH_REPORT.md), not the engine. The one
+exception is `meme_coins`: it extends the trend overlay to meme coins (see
+[Other coins and meme coins](#other-coins-and-meme-coins)). For example:
+
+```bash
+python -m quant.data check                 # gaps, outages, bad bars (prints only)
+python -m quant.studies.trend              # daily trend vs vol-targeted hold vs random timing -> trend_daily.json
+python -m quant.studies.event_hypotheses   # sweeps, cascades, flow reversals, breakouts...
+python -m quant.report                     # markdown tables from a fixed set of results
+```
+
+`quant.report` prints "not available" for any section whose study hasn't run.
+
+Each study writes its results to `data/results/` (for example `daily_panel_h3.json`) and covers the research period only.
 
 How to read the engine's output:
 
@@ -199,7 +242,7 @@ Settings for `/api/engine`:
 
 | Variable | Meaning | Default |
 |---|---|---|
-| `ENGINE_SYMBOLS` | Comma-separated coins to evaluate | all 16 |
+| `ENGINE_SYMBOLS` | Comma-separated coins to evaluate. Unless the list contains all 16 default coins, the model specialists lose their cross-asset inputs and show "features unavailable" (NO TRADE). To add coins such as memes, list the 16 defaults plus the extras. The trend overlay is unaffected. A coin without downloaded history starts with 8 days of data and fills in older history over the next few refreshes. | all 16 |
 | `ENGINE_BOOK=0` | Skip the live order-book liquidity veto | on |
 | `ENGINE_TTL` | Seconds to cache the result | 300 |
 
@@ -461,6 +504,7 @@ quant/           research harness and signal engine (see docs/RESEARCH_REPORT.md
   monitor.py     CUSUM degradation monitor
   engine.py      specialists, consensus verdicts, live gates
   train_engine.py frozen candidates, one-time holdout evaluation
+  build_engine.py one command: data, the studies the engine needs, train_engine
   studies/       every experiment, including the ones that failed
 app/
   server.py      FastAPI backend (/api/dashboard, /api/scanner, /api/plan, /api/engine)

@@ -18,6 +18,7 @@ import json
 import math
 import os
 import re
+import threading
 import time
 from pathlib import Path
 
@@ -271,31 +272,69 @@ def scanner():
 # ------------------------------------------------------------ signal engine
 
 ENGINE_TTL_SECONDS = int(os.environ.get("ENGINE_TTL", 300))
-_engine_state: dict = {"engine": None, "at": 0.0, "payload": None}
+_engine_state: dict = {"engine": None, "at": 0.0, "payload": None, "files": None}
+# One engine run at a time: a reload can't swap specialists under a running engine, and two
+# open tabs don't sync 16 coins twice.
+_engine_lock = threading.Lock()
+ENGINE_NOT_BUILT = (
+    "Signal engine not built yet. Build it with `docker compose run --rm web python -m quant.build_engine` "
+    "(without Docker: `python -m quant.build_engine`). It downloads about 3 GB of 1-minute history and "
+    "takes a few hours; this page picks it up automatically when it is done."
+)
 
 
-def _get_engine():
+def _engine_files() -> tuple:
+    """Name, size and mtime of every engine artifact: a change means a (re)trained engine."""
+    import quant.engine as qe
+
+    out = []
+    for path in sorted([*qe.ENGINE_DIR.glob("*.joblib"), qe.ENGINE_DIR / "trend_evidence.json"]):
+        try:
+            st = path.stat()
+        except FileNotFoundError:
+            continue
+        out.append((path.name, st.st_size, st.st_mtime_ns))
+    return tuple(out)
+
+
+def _get_engine(files: tuple):
+    """The engine, rebuilt whenever models/engine changes (no restart needed after training)."""
+    import quant.engine as qe
     from quant.data import UNIVERSE
-    from quant.engine import Engine, load_specialists
+    from quant.paper import PaperLedger
 
-    if _engine_state["engine"] is None:
-        specs = load_specialists()
-        if not specs:
-            raise HTTPException(status_code=503, detail="Signal engine not trained yet: run `python -m quant.train_engine`.")
-        symbols = os.environ.get("ENGINE_SYMBOLS", ",".join(UNIVERSE)).split(",")
-        from quant.paper import PaperLedger
-
-        _engine_state["engine"] = Engine(symbols, specs, use_book=os.environ.get("ENGINE_BOOK", "1") == "1",
-                                         paper=PaperLedger())
+    if _engine_state["engine"] is not None and _engine_state["files"] == files:
+        return _engine_state["engine"]
+    try:
+        specs = qe.load_specialists(qe.ENGINE_DIR)
+    except Exception as exc:  # e.g. an artifact from an older version of the code
+        raise HTTPException(status_code=503, detail=f"Could not load the signal engine from models/engine: {exc}") from exc
+    if not specs:
+        raise HTTPException(status_code=503, detail=ENGINE_NOT_BUILT)
+    old = _engine_state["engine"]
+    listed = os.environ.get("ENGINE_SYMBOLS") or ",".join(UNIVERSE)
+    symbols = [s.strip() for s in listed.split(",") if s.strip()] or list(UNIVERSE)
+    # A fresh market-data store re-seeds from the (possibly just downloaded) history files;
+    # the paper ledger carries over.
+    _engine_state["engine"] = qe.Engine(symbols, specs, use_book=os.environ.get("ENGINE_BOOK", "1") == "1",
+                                        paper=old.paper if old else PaperLedger())
+    _engine_state.update(files=files, payload=None)
     return _engine_state["engine"]
 
 
 @app.get("/api/engine")
 def engine_signals():
     """Evidence-gated signals for every symbol and specialist (NO TRADE unless justified)."""
-    if _engine_state["payload"] is not None and time.time() - _engine_state["at"] < ENGINE_TTL_SECONDS:
+    with _engine_lock:
+        return _engine_payload()
+
+
+def _engine_payload():
+    files = _engine_files()
+    if (_engine_state["payload"] is not None and _engine_state["files"] == files
+            and time.time() - _engine_state["at"] < ENGINE_TTL_SECONDS):
         return _engine_state["payload"]
-    eng = _get_engine()
+    eng = _get_engine(files)
     signals = eng.run()
     specialists = [{"name": sp.name, "horizon": sp.horizon, "evidence": _json_safe(json.loads(json.dumps(
         sp.evidence.__dict__, default=str))), "health": sp.health.snapshot()} for sp in eng.specialists]

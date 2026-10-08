@@ -260,6 +260,7 @@ class EventSpecialist:
 
     MAX_EVENT_AGE = pd.Timedelta(seconds=90)
     LOOKBACK = pd.Timedelta(days=40)       # sigma (1-day halflife) + 30-day imbalance percentile
+    MIN_HISTORY = pd.Timedelta(days=16)    # the 30-day percentile needs half its window
 
     def __init__(self, artifact: dict):
         self.a = artifact
@@ -280,6 +281,12 @@ class EventSpecialist:
                     evidence=asdict(self.evidence), health=self.health.snapshot())
         if symbol not in self.a["symbols"]:
             return Signal(action="NO TRADE", as_of=str(now), reasons=["outside this specialist's tested universe"], **base)
+        first = m1["close"].first_valid_index()
+        if first is None or m1.index[-1] - first < self.MIN_HISTORY:
+            held = 0 if first is None else (m1.index[-1] - first).days
+            return Signal(action="NO TRADE", as_of=str(now), reasons=[
+                f"only {held} days of 1-minute history so far; the event rule needs {self.MIN_HISTORY.days} "
+                "(30-day taker-flow percentile), so it cannot see events yet"], **base)
         tail = m1[m1.index > m1.index[-1] - self.LOOKBACK]
         b = Bars(tail)
         sig = h_flow_driven_reversal(b, int(self.a["W"]), float(self.a["k"]))

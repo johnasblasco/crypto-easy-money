@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures as cf
+import os
 import time
 from pathlib import Path
 
@@ -91,7 +92,12 @@ def download(symbol: str, start: str = "2020-01-01", end: str | None = None, thr
 
     existing = None
     if path.exists():
-        existing = pd.read_parquet(path)
+        try:
+            existing = pd.read_parquet(path)
+        except Exception as exc:  # e.g. cut off by a crash in an older, non-atomic write
+            path.rename(path.with_name(path.name + ".corrupt"))
+            print(f"{symbol}: unreadable history file moved aside ({exc}); downloading again", flush=True)
+    if existing is not None:
         start_ms = max(start_ms, int(existing["open_time"].iloc[-1]) + MINUTE_MS)
     else:
         start_ms = _first_available(session, symbol, start_ms)
@@ -118,7 +124,9 @@ def download(symbol: str, start: str = "2020-01-01", end: str | None = None, thr
     if existing is not None:
         df = pd.concat([existing, df])
     df = df.drop_duplicates("open_time").sort_values("open_time").reset_index(drop=True)
-    df.to_parquet(path, index=False)
+    tmp = path.with_name(path.name + ".tmp")
+    df.to_parquet(tmp, index=False)
+    os.replace(tmp, path)            # an interrupted download never leaves a cut-off file
     if verbose:
         print(f"{symbol}: {len(df):,} bars -> {path} ({time.time() - t0:.0f}s)", flush=True)
     return path
@@ -233,11 +241,17 @@ def main(argv=None):
     args = p.parse_args(argv)
 
     if args.cmd == "download":
+        failed = []
         for sym in args.symbols:
             try:
                 download(sym, args.start, args.end, args.threads)
             except Exception as exc:  # keep going with the rest of the universe
                 print(f"!! {sym}: {exc}", flush=True)
+                failed.append(sym)
+        if failed:
+            print(f"!! {len(failed)} of {len(args.symbols)} downloads failed: {' '.join(failed)}. "
+                  "Rerun the same command to retry them.", flush=True)
+            return 1
     else:
         rows = []
         for sym in args.symbols:
@@ -245,7 +259,8 @@ def main(argv=None):
             if path.exists():
                 rows.append({"symbol": sym, **quality_report(load(sym))})
         print(pd.DataFrame(rows).to_string(index=False))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -187,13 +187,6 @@ def r4_max_effect():
     ret7 = np.log(close / close.shift(7))
     ret28 = np.log(close.shift(1) / close.shift(29))
     vol30 = lr.rolling(30).std()
-    ew_r = lr.mean(axis=1)
-    idio = pd.DataFrame(index=lr.index, columns=LARGE, dtype=float)
-    for s in LARGE:
-        cov = lr[s].rolling(30).cov(ew_r)
-        beta = cov / ew_r.rolling(30).var()
-        resid = lr[s] - beta * ew_r
-        idio[s] = resid.rolling(30).std()
     mondays = pd.date_range("2020-03-02", "2025-09-22", freq="7D", tz="UTC")
     low, high_, ew = {}, {}, {}
     for D in mondays:
@@ -204,6 +197,18 @@ def r4_max_effect():
         v = mx.loc[D, elig].sort_index().sort_values(kind="mergesort")
         n3 = len(elig) // 3
         low[D], high_[D], ew[D] = list(v.index[:n3]), list(v.index[-n3:]), elig
+    # 30-day idiosyncratic volatility at each sort date, as pre-registered: one OLS (with intercept) of the
+    # coin's daily log returns over D-29..D on the mean return of that week's eligible coins.
+    idio = pd.DataFrame(np.nan, index=mondays, columns=LARGE)
+    for D, names in ew.items():
+        win = lr.loc[D - pd.Timedelta(days=29):D, names]
+        mkt = win.mean(axis=1)
+        for s_ in names:
+            df = pd.concat([win[s_], mkt], axis=1).dropna()
+            if len(df) >= 20:
+                A = np.column_stack([np.ones(len(df)), df.iloc[:, 1]])
+                resid = df.iloc[:, 0].to_numpy() - A @ np.linalg.lstsq(A, df.iloc[:, 0].to_numpy(), rcond=None)[0]
+                idio.at[D, s_] = resid.std(ddof=1)
     g_lo, c_lo = weekly_book(low, fill, PERP)
     g_hi, c_hi = weekly_book(high_, fill, PERP)
     fund = PERP.holding(1440, 1)
@@ -212,7 +217,7 @@ def r4_max_effect():
     p_bs = week_block_bootstrap_p(s, two_sided=True)
     nxt = _eligible_only(fill.shift(-7) - fill, ew)
     fm = fama_macbeth(nxt, {"max": mx.loc[mondays], "ret7": ret7.loc[mondays], "ret28": ret28.loc[mondays],
-                                          "vol30": vol30.loc[mondays], "idio30": idio.loc[mondays]})
+                                          "vol30": vol30.loc[mondays], "idio30": idio})
     sign_spread = np.sign(s.mean())
     # Spread is LOW - HIGH, so a positive spread means a NEGATIVE MAX slope.
     passed = bool(np.sign(fm["mean_slope"]) == -sign_spread and abs(fm["nw_t"]) >= 1.96)

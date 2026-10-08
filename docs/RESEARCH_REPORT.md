@@ -27,6 +27,8 @@ What the data *does* support:
    - Buying an altcoin after a forced, one-sided sell-off earned +33 bp per event net in 2020–2025, mostly in 2020–21.
    - On the holdout it lost −13.5 bp per event over 303 events.
 
+A further eight trader-psychology hypotheses all failed their pre-registered tests (§4.10). They were found by a literature search and filtered against everything already tested. The best of them, round-number stop cascades, is real but worth 1.5 bp against roughly 20 bp of costs.
+
 Every "edge" the search produced at first glance fell apart under adversarial testing:
 - **Market beta:** the daily ML panel's +316 bp per trade.
 - **Data artifacts and one episode:** the stablecoin premium's t = −3.4 came from prices carried through a five-month trading halt and from the March 2023 USDC de-peg.
@@ -89,6 +91,7 @@ The working assumption was that the obvious answers are probably wrong, such as 
 | Quarter-hour opening imbalance | Weak continuation (t ≈ 2 at 4h); fails Holm; tiny effect | — |
 | Stablecoin premium → BTC | t = −3.4 at first; a trading-halt artifact plus the March 2023 USDC de-peg (t = −1.1 on real trading days) | — |
 | Regime specialists / regime calibration | Worse than one global model (DM p ≈ 1) | — |
+| 8 trader-psychology hypotheses (round numbers, 52-week-high anchoring, lottery coins, NY-close momentum, options expiry, turn of month, chart patterns) | All 8 fail their pre-registered tests; round-number breaks show a real but tiny +1.5 bp effect | — |
 | Daily trend overlay on 22 meme coins (new assets, rule unchanged) | Drawdown −26% vs −50% (vol-targeted) and −93% (buy & hold) | **Overlay holds:** −3.6%/yr vs −50.6%/yr buy & hold; drawdown −16% vs −74% |
 
 ### 4.2 Short-horizon direction: real information, no profit
@@ -302,6 +305,34 @@ Conclusion: on meme coins, as on large coins, the overlay reliably limits losses
 - after the half-tick cost, the strategy loses money at every confidence threshold.
 
 Accuracy on coarse-tick coins measures the tick grid, not the market.
+
+### 4.10 Trader psychology: eight pre-registered hypotheses
+
+From `psychology.json` (`quant/studies/psychology.py`; definitions in `docs/PREREGISTRATION_PSYCHOLOGY.md`, committed before any run).
+
+**How the eight were chosen.** Three research agents searched the published evidence, from three angles:
+- behavioural finance;
+- market structure and calendar effects;
+- rigorous tests of chart patterns.
+
+A skeptical reviewer then removed 12 candidates. Some repeated ideas this repo had already rejected (candlestick reversals, Wyckoff springs, CME gap fills, VWAP reversion). Others could not be tested with spot data, such as funding-clock effects. Each survivor got exactly one primary test, with Holm correction across the eight. An independent audit of the code found no look-ahead. One minor control-variable deviation in R4 was fixed, with no change in verdict.
+
+| # | Hypothesis | Primary result (research period) | Holm p | Verdict |
+|---|---|---|---|---|
+| R1 | Anchoring to the 52-week high (weekly long top third vs equal weight, 16 coins) | −3.8 bp/day, t = −0.88 | 1.00 | FAIL |
+| R2 | Intraday momentum into the NY close (BTC+ETH, 1h) | −14.8 bp/event net (gross −2.7) | 1.00 | FAIL |
+| R3 | Round-number break continuation vs arbitrary levels | +1.5 bp more than control (87k events), but −18.7 bp/event net | 0.0000 | FAIL (net) |
+| R4 | Lottery coins (largest daily jump last week), low minus high | −14.6 bp/day, two-sided p = 0.07 | 0.49 | FAIL |
+| R5 | Deribit monthly expiry rebound at 08:00 UTC | +4.2 bp vs other days, p = 0.42; −7.7 bp net | 1.00 | FAIL |
+| R6 | Fading the first touch of a round number | −1.7 bp vs control; −12.9 bp/event net | 1.00 | FAIL |
+| R7 | Turn of the month (last day to day 3) | +18 bp/day excess, t = 0.75 | 1.00 | FAIL |
+| R8 | Kernel-detected head-and-shoulders and double tops/bottoms (4h bars, 1-day hold) | −21.4 bp/event net; −5.4 bp vs placebo | 1.00 | FAIL |
+
+What this adds:
+
+- **The psychology is real but too small to trade.** Round-number breaks behave as the stop-loss-cascade story predicts: price runs 1.5 bp further than after an arbitrary level, which is highly significant over 87,000 breaks. But a taker round trip costs about 20 bp, so the crowd's behaviour is visible and still not tradeable.
+- **Chart patterns failed outright.** Head-and-shoulders and double tops/bottoms were detected mechanically, so there was no hindsight in drawing them. Over the next day they did worse than random times with the same hour and volatility.
+- **Calendar and lottery effects are noise.** Their point estimates have the predicted or the opposite sign, and none comes near significance after correction.
 
 ## 5. The engine
 

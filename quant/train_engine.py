@@ -176,14 +176,30 @@ def _replace(src: Path, dst: Path, tries: int = 10) -> None:
             time.sleep(1)
 
 
+def recover(target: Path | None = None) -> None:
+    """If a swap was interrupted (no engine folder but a .old one), put the previous engine back."""
+    target = target or ENGINE_DIR
+    old = target.with_name(target.name + ".old")
+    if not target.exists() and old.exists():
+        _replace(old, target)
+
+
 def publish(staging: Path, target: Path | None = None) -> None:
     """Swap a finished build in, so the dashboard sees the old engine or the new one, never a mix."""
     target = target or ENGINE_DIR
     old = target.with_name(target.name + ".old")
+    recover(target)
     shutil.rmtree(old, ignore_errors=True)
+    if old.exists():
+        raise RuntimeError(f"could not remove {old}; delete it, then rerun")
     if target.exists():
         _replace(target, old)
-    _replace(staging, target)
+    try:
+        _replace(staging, target)
+    except BaseException:
+        if old.exists() and not target.exists():
+            os.replace(old, target)          # put the previous engine back
+        raise
     shutil.rmtree(old, ignore_errors=True)
 
 
@@ -390,6 +406,7 @@ def main():
     # Build into a staging folder and swap it in at the end: a crash or a dashboard
     # refresh mid-training never sees a half-built engine, and the previous one survives.
     staging = ENGINE_DIR.with_name(ENGINE_DIR.name + ".new")
+    recover()
     shutil.rmtree(staging, ignore_errors=True)
     staging.mkdir(parents=True)
     ev = write_trend_evidence(staging)

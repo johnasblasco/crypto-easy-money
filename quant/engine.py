@@ -338,10 +338,12 @@ class Engine:
         others = None
         out = []
         frames = {}
+        if sync:
+            self.store.backfill_pass()      # older bars for coins without local files, before freshness matters
         for sym in self.symbols:
             try:
                 if sync:
-                    self.store.sync(sym)
+                    self.store.sync(sym, backfill=False)
                 frames[sym] = self.store.frame(sym)
             except Exception as exc:  # network etc.
                 frames[sym] = exc

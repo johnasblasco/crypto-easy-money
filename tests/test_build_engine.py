@@ -281,6 +281,100 @@ def test_event_rule_says_when_history_is_too_short():
     assert "days of 1-minute history" in sig.reasons[0]
 
 
+def test_backfill_pass_shares_one_budget_and_comes_before_the_forward_sync(tmp_path, monkeypatch):
+    monkeypatch.setattr(live, "KLINE_DIR", tmp_path)
+    session = FakeSession()
+    store = live.LiveStore(session=session)
+    for coin in ("AAAUSDT", "BBBUSDT"):
+        store.sync(coin, backfill=False)                 # forward only: fresh, still owed older history
+    assert store.backfill == {"AAAUSDT", "BBBUSDT"}
+    n = len(session.params)
+    store.backfill_pass(budget=5)
+    assert len(session.params) - n == 5                  # one budget for all such coins per run
+
+    calls = []
+
+    class Recorder:
+        backfill = set()
+
+        def backfill_pass(self):
+            calls.append("backfill")
+
+        def sync(self, symbol, backfill=True):
+            calls.append(("sync", symbol, backfill))
+
+        def frame(self, symbol):
+            return store.frame("AAAUSDT")
+
+    E.Engine(["AAAUSDT", "BBBUSDT"], [], store=Recorder(), use_book=False).run()
+    assert calls == ["backfill", ("sync", "AAAUSDT", False), ("sync", "BBBUSDT", False)]
+
+
+def test_dry_run_shows_the_rerun_cascade(layout):
+    run, _ = fake_runner()
+    B.build(B.steps(), [].append, runner=run)
+    assert B.to_do(B.steps()) == [False] * 6
+    assert B.to_do(B.steps(retrain=True)) == [False] * 5 + [True]
+    (X.RESULTS_DIR / "daily_panel_h1.json").unlink()
+    assert B.to_do(B.steps()) == [False, False, False, True, True, True]
+
+
+def test_refresh_updates_fear_and_greed_and_clears_caches(layout, monkeypatch):
+    monkeypatch.setattr(X, "FEATURE_DIR", layout / "features")
+    X.FEATURE_DIR.mkdir()
+    fetched = []
+    monkeypatch.setattr(D, "fetch_fng", lambda: fetched.append(1))
+    assert B.refresh_history([].append, runner=lambda args, out: 0) == 0
+    assert fetched and not X.FEATURE_DIR.exists()
+
+    def offline():
+        raise OSError("no network")
+
+    monkeypatch.setattr(D, "fetch_fng", offline)
+    log = []
+    assert B.refresh_history(log.append, runner=lambda args, out: 0) == 1
+    assert any("Fear & Greed" in line for line in log)
+
+
+def test_build_always_ends_with_a_finished_line(tmp_path, monkeypatch):
+    monkeypatch.setattr(B, "_log_path", lambda: tmp_path / "logs" / "build_engine.log")
+    monkeypatch.setattr(B, "preflight", lambda out, need_download: None)
+    monkeypatch.setattr(B, "steps", lambda retrain=False: [])
+    monkeypatch.setattr(B, "summarize", lambda out: None)
+    assert B.main([]) == 0
+    assert (tmp_path / "logs" / "build_engine.log").read_text().splitlines()[-1].startswith(
+        "=== build_engine finished: OK")
+    monkeypatch.setattr(B, "build", lambda plan, out: 1)
+    assert B.main([]) == 1
+    assert "finished: FAILED" in (tmp_path / "logs" / "build_engine.log").read_text().splitlines()[-1]
+
+
+def test_failed_engine_swap_puts_the_previous_engine_back(tmp_path, monkeypatch):
+    from quant import train_engine as T
+
+    target, staging = tmp_path / "engine", tmp_path / "engine.new"
+    for d, text in ((target, "old engine"), (staging, "new engine")):
+        d.mkdir()
+        (d / "trend_evidence.json").write_text(text)
+    real, calls = T._replace, []
+
+    def flaky(src, dst, tries=10):
+        calls.append(src.name)
+        if len(calls) == 2:
+            raise PermissionError("held open by antivirus")
+        real(src, dst, tries)
+
+    monkeypatch.setattr(T, "_replace", flaky)
+    with pytest.raises(PermissionError):
+        T.publish(staging, target)
+    assert (target / "trend_evidence.json").read_text() == "old engine"     # rolled back
+    # A swap killed between its two renames: the next run restores the previous engine first.
+    target.rename(tmp_path / "engine.old")
+    monkeypatch.setattr(T, "_replace", real)
+    T.recover(target)
+    assert (target / "trend_evidence.json").read_text() == "old engine"
+
+
 # ------------------------------------------------------------ dashboard reload
 
 def write_trend(engine_dir, summary):

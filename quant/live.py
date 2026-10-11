@@ -24,6 +24,7 @@ MAX_RECENT_GAP_FRAC = 0.02                   # >2% missing minutes in the last d
 # specialist falls back to daily bars when 1-minute history is short; download the coin
 # (python -m quant.data download --symbols ...) for anything that needs more.
 COLD_START_DAYS = 8
+BACKFILL_PAGES_PER_RUN = 240     # older-history requests per engine run, shared by all such coins
 
 
 def _to_frame(rows: list) -> pd.DataFrame:
@@ -67,7 +68,7 @@ class LiveStore:
             self.backfill.add(symbol)
         self.raw[symbol] = df
 
-    def sync(self, symbol: str, max_requests: int = 60) -> int:
+    def sync(self, symbol: str, max_requests: int = 60, backfill: bool = True) -> int:
         """Fetch closed bars after the last stored one. Returns the number of new bars."""
         if symbol not in self.raw:
             self.seed(symbol)
@@ -95,25 +96,39 @@ class LiveStore:
             df = pd.concat([df, add]).drop_duplicates("open_time").sort_values("open_time")
             cutoff = now_ms - self.days * 86_400_000
             self.raw[symbol] = df[df["open_time"] >= cutoff].reset_index(drop=True)
-        if symbol in self.backfill:
+        if backfill and symbol in self.backfill:
             self._backfill(symbol, max_requests - used, now_ms)
         self.last_sync[symbol] = pd.Timestamp.now(tz="UTC")
         return len(new)
 
-    def _backfill(self, symbol: str, budget: int, now_ms: int) -> None:
-        """Fetch older bars for a coin that started without local history, with the requests
-        left over from this sync, until ``days`` are covered or the coin's listing is reached."""
-        df = self.raw[symbol]
-        if not len(df):
-            return
+    def backfill_pass(self, budget: int = BACKFILL_PAGES_PER_RUN) -> None:
+        """Older history for coins that started without local files, within one request budget.
+
+        The engine runs this before its forward sync: it doesn't affect freshness, which the
+        short forward pass then decides for every coin.
+        """
+        now_ms = int(time.time() * 1000)
+        for symbol in list(self.backfill):
+            if budget <= 0:
+                break
+            budget -= self._backfill(symbol, min(60, budget), now_ms)
+
+    def _backfill(self, symbol: str, budget: int, now_ms: int) -> int:
+        """Fetch older bars for a coin that started without local history, until ``days`` are
+        covered or the coin's listing is reached. Returns the number of requests made."""
+        df = self.raw.get(symbol)
+        if df is None or not len(df):
+            return 0
         target = now_ms - self.days * 86_400_000
         end = int(df["open_time"].iloc[0]) - MINUTE_MS
         older = []
+        used = 0
         try:
             for _ in range(budget):
                 if end < target:
                     self.backfill.discard(symbol)
                     break
+                used += 1
                 r = self.session.get(API, params={"symbol": symbol, "interval": "1m", "limit": 1000, "endTime": end},
                                      timeout=15)
                 r.raise_for_status()
@@ -128,6 +143,7 @@ class LiveStore:
         if older:
             df = pd.concat([_to_frame(older), df]).drop_duplicates("open_time").sort_values("open_time")
             self.raw[symbol] = df[df["open_time"] >= target].reset_index(drop=True)
+        return used
 
     def frame(self, symbol: str) -> pd.DataFrame:
         if not len(self.raw[symbol]):

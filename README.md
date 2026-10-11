@@ -52,7 +52,7 @@ Any Binance spot pair works; pass its symbol:
 python -m cryptopredict.train --source binance --symbol PEPEUSDT --interval 1h
 python -m cryptopredict.experiments --symbols PEPEUSDT SHIBUSDT BONKUSDT WIFUSDT --intervals 1h 4h   # for the scanner
 python -m quant.data download --symbols PEPEUSDT SHIBUSDT BONKUSDT   # 1-minute history for the research engine
-ENGINE_SYMBOLS=BTCUSDT,ETHUSDT,PEPEUSDT,SHIBUSDT uvicorn app.server:app   # coins on the engine card (to keep the model specialists' inputs, list all 16 defaults plus the memes)
+ENGINE_SYMBOLS=BTCUSDT,ETHUSDT,BNBUSDT,XRPUSDT,ADAUSDT,DOGEUSDT,SOLUSDT,LINKUSDT,LTCUSDT,TRXUSDT,AVAXUSDT,DOTUSDT,ATOMUSDT,BCHUSDT,ETCUSDT,XLMUSDT,PEPEUSDT,SHIBUSDT uvicorn app.server:app   # the 16 defaults plus memes
 ```
 
 The engine's trend overlay only sizes coins it has been tested on. To test it on
@@ -82,7 +82,7 @@ What is different about meme coins (measured on Binance data, October 2026):
 
   It limits losses; it does not make memes profitable. The engine applies the overlay only to coins it was tested on, and says so for any other coin:
   - a plain `quant.build_engine` covers the 16 main coins;
-  - after the meme study and a retrain (below), it covers 37: the 16 main coins and 21 other memes.
+  - after the meme study and a retrain (above), it also covers every meme coin the study tested: 37 coins (the 16 main coins and 21 other memes) if you downloaded all 22 in `MEMES`.
 - **No short-term meme trading signal was validated.**
 
 ## Run with Docker
@@ -148,12 +148,12 @@ Notes:
   docker compose build                                            #   update the code and the image first
   docker compose stop web                                         # frees memory for the build
   docker compose run --rm web python -m quant.build_engine        # a few hours; rerun to resume after an error
-  docker compose up -d                                            # after it prints "Engine built"
+  docker compose up -d                                            # after "build_engine finished: OK"
   ```
 
   - **Progress:** the build also writes to `data/logs/build_engine.log`. Follow it with `tail -f data/logs/build_engine.log`, or in PowerShell with `Get-Content data\logs\build_engine.log -Wait -Tail 20`.
   - **Closing the terminal doesn't stop the build.** It keeps running in its container. Check with `docker ps`, and stop it with `docker stop <container id>`.
-  - **Getting your terminal back:** start the build with `docker compose run -d --rm web python -m quant.build_engine`. Then run `docker compose up -d` only once the log ends with "Engine built" or "!! Step failed".
+  - **Getting your terminal back:** start the build with `docker compose run -d --rm web python -m quant.build_engine`. Then run `docker compose up -d` only once the log's last line says `=== build_engine finished: OK` (or `FAILED`).
   - **Running it twice:** a second build refuses to start while one is running.
   - **First load:** the engine's first load after each start syncs every coin from Binance and can take a few minutes.
   - **Expect NO TRADE for every coin.** No trading signal passed the holdout test. Only the trend overlay passed, and only as a risk overlay, so the card shows its exposure as position-size guidance, never as a trade.
@@ -206,7 +206,7 @@ It runs, in order:
 
 More options:
 - `--retrain` reruns only `train_engine`.
-- `--refresh` first brings every coin's history up to today and clears the feature caches, then retrains. The research studies use data from before the holdout only, so they stay valid.
+- `--refresh` first brings every coin's history and the Fear & Greed index up to today and clears the feature caches, then retrains. The research studies use data from before the holdout only, so they stay valid.
 
 **More research studies.** Every other study in `quant/studies/` feeds
 [docs/RESEARCH_REPORT.md](docs/RESEARCH_REPORT.md), not the engine. The one

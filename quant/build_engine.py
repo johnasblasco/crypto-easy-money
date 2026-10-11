@@ -51,7 +51,7 @@ from . import ledger as L
 
 DOWNLOAD_ATTEMPTS = 3
 RETRY_WAIT_S = 60          # x attempt number: lets a short network outage pass
-MIN_MEMORY_GB = 7.5
+MIN_MEMORY_GB = 9.5        # decimal GB: a default 8 GiB Docker VM warns, a 10 GB one doesn't
 MIN_FREE_DISK_GB = 5.0
 MEMORY_ADVICE = ("   Docker Desktop: give it at least 10 GB (Mac / Hyper-V: Settings > Resources; Windows with WSL 2: "
                  "memory=10GB under [wsl2] in %UserProfile%\\.wslconfig, then wsl --shutdown and restart Docker "
@@ -221,13 +221,24 @@ def memory_gb() -> float | None:
 def preflight(out: Callable[[str], None], need_download: bool) -> None:
     mem = memory_gb()
     if mem is not None and mem < MIN_MEMORY_GB:
-        out(f"!! Only {mem:.1f} GB of memory is available; the studies and training need about 8 GB and may be killed.")
+        out(f"!! Only {mem:.1f} GB of memory is available; the studies and training need about 8 GB (give Docker 10 GB) "
+            "and may be killed.")
         out(MEMORY_ADVICE)
     if need_download:
         D.KLINE_DIR.mkdir(parents=True, exist_ok=True)
         free = shutil.disk_usage(D.KLINE_DIR).free / 1e9
         if free < MIN_FREE_DISK_GB:
             out(f"!! Only {free:.1f} GB of free disk space; the history needs about 3 GB plus about 1 GB of caches.")
+
+
+def to_do(plan: list[Step]) -> list[bool]:
+    """Which steps a build would run: not done yet, forced, or after a step that reruns."""
+    out, ran = [], False
+    for step in plan:
+        run = step.force or ran or not step.done()
+        ran = ran or run
+        out.append(run)
+    return out
 
 
 def build(plan: list[Step], out: Callable[[str], None], runner=run_module) -> int:
@@ -274,6 +285,12 @@ def refresh_history(out: Callable[[str], None], runner=run_module) -> int:
     if runner(["quant.data", "download"], out) != 0:
         out("!! Updating the history failed (see above). Rerun the same command to retry.")
         return 1
+    try:                                   # the daily-panel model's sentiment input, also stale otherwise
+        D.fetch_fng()
+    except Exception as exc:
+        out(f"!! Updating the Fear & Greed index failed ({exc}). Check the network (api.alternative.me) and rerun.")
+        return 1
+    out(f"updated {D.FNG_PATH}")
     shutil.rmtree(X.FEATURE_DIR, ignore_errors=True)
     out(f"cleared the feature caches in {X.FEATURE_DIR}")
     return 0
@@ -301,13 +318,15 @@ def main(argv=None) -> int:
     p.add_argument("--refresh", action="store_true",
                    help="update every coin's history to today, then retrain (the research studies are unaffected)")
     args = p.parse_args(argv)
+    from .train_engine import recover
+
+    recover(E.ENGINE_DIR)                  # an engine swap that was interrupted: put the previous engine back
     plan = steps(retrain=args.retrain or args.refresh)
     if args.dry_run:
         if args.refresh:
-            print("first: update every coin's 1-minute history to today and clear the feature caches")
-        for i, step in enumerate(plan, 1):
-            state = "to do" if (step.force or not step.done()) else "done "
-            print(f"[{i}/{len(plan)}] {state}  {step.name}: {step.why}")
+            print("first: update every coin's 1-minute history and the Fear & Greed index, clear the feature caches")
+        for i, (step, run) in enumerate(zip(plan, to_do(plan)), 1):
+            print(f"[{i}/{len(plan)}] {'to do' if run else 'done '}  {step.name}: {step.why}")
         return 0
     try:
         out = Tee(_log_path())
@@ -320,16 +339,18 @@ def main(argv=None) -> int:
     if not lock.acquire():
         out(f"!! Another build is already running: {lock.describe()}. Follow it in {_log_path()}.")
         out(f"   A build that was killed (e.g. docker stop) leaves this lock behind; it expires "
-            f"{BuildLock.STALE_S // 60} minutes after its last heartbeat.")
+            f"{BuildLock.STALE_S // 60} minutes after its last heartbeat. If `docker ps` shows no build, "
+            f"you can delete {lock.path}.")
         return 1
+    rc = 1
     try:
         out(f"=== build_engine started {time.strftime('%Y-%m-%d %H:%M:%S')} (log: {_log_path()})")
         preflight(out, need_download=bool(missing_coins()))
-        if args.refresh and refresh_history(out) != 0:
-            return 1
-        return build(plan, out)
+        rc = 1 if args.refresh and refresh_history(out) != 0 else build(plan, out)
+        return rc
     finally:
         lock.release()
+        out(f"=== build_engine finished: {'OK' if rc == 0 else 'FAILED'} {time.strftime('%Y-%m-%d %H:%M:%S')}")
 
 
 if __name__ == "__main__":

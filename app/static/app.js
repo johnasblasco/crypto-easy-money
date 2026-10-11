@@ -761,7 +761,8 @@
     $("ap-trades").innerHTML = rows.length
       ? rows.slice(0, 15).map((t) => {
           const res = t.pnl_pct;
-          const status = t.open ? `holding, sells ${fmtShort(t.exit_time)}` : `sold ${fmtShort(t.closed)}`;
+          const status = (t.open ? `holding, sells ${fmtShort(t.exit_time)}` : `sold ${fmtShort(t.closed)}`) +
+            (t.replayed ? " · caught up" : "");
           const now = t.open ? (t.price == null ? "—" : fmtPrice(t.price)) : fmtPrice(t.exit_price);
           return `<tr><td>${esc(baseAsset(t.symbol))} <span class="muted">${esc(t.interval)}</span></td><td>${esc(status)}</td>` +
             `<td>${fmtPrice(t.entry_price)}</td><td>${now}</td><td class="${res >= 0 ? "up" : "down"}">${fmtSignedPct(res)}</td></tr>`;

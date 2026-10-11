@@ -187,3 +187,102 @@ def test_autopilot_api(tmp_path, monkeypatch):
     body = client.get("/api/autopilot").json()
     assert body["running"] and [a["key"] for a in body["accounts"]] == ["models", "trend", "hold"]
     assert body["guide"][0]["symbol"] == "BTCUSDT"
+
+
+# ------------------------------------------------------------ catching up after a pause
+
+class CycleModel:
+    """predict_proba cycling through fixed P(UP) values, one per row."""
+
+    def __init__(self, probs):
+        self.probs = probs
+
+    def predict_proba(self, X):
+        p = np.resize(np.asarray(self.probs, float), len(X))
+        return np.column_stack([1 - p, p])
+
+
+def candles(end, n=500, interval="1h"):
+    idx = pd.date_range(end=end, periods=n, freq=interval, tz="UTC")       # open times
+    return pd.DataFrame({"timestamp": idx, "open": 100.0, "high": 101.0, "low": 99.0,
+                         "close": 100.0 + np.arange(n) * 0.1, "volume": 10.0})
+
+
+def test_replay_finds_the_calls_the_live_scan_would_have_seen():
+    until = pd.Timestamp("2026-10-11 06:00", tz="UTC")
+    since = until - pd.Timedelta("6h")
+    df = candles(until - pd.Timedelta("1h"))              # last candle closes exactly at `until`
+    cfg = {"symbol": "SOLUSDT", "interval": "1h", "horizon": 2, "verdict": "NO EDGE",
+           "bundle": {"features": ["close"], "threshold": 0.6, "model": CycleModel([0.7, 0.4, 0.55])}}
+    calls, closes = A.replay_calls([cfg], since, until, {"SOLUSDT_1h_h2": 0.001}, load=lambda s, i, n: df)
+    times = [c["signal_time"] for c in calls]
+    assert times and all(since < pd.Timestamp(t) <= until for t in times)
+    assert all(c["confidence"] >= 0.6 for c in calls)               # 0.55 is UP but below its threshold
+    first = calls[0]
+    assert pd.Timestamp(first["exit_time"]) - pd.Timestamp(first["signal_time"]) == pd.Timedelta("2h")
+    s = closes[("SOLUSDT", "1h")]
+    assert s.index[-1] == until and first["price"] == s[pd.Timestamp(first["signal_time"])]
+    assert A.replay_calls([cfg], since, until, {}, load=lambda s, i, n: df) == ([], {})   # not a Binance model
+
+
+def test_catch_up_sells_at_the_exit_time_price_and_copies_missed_calls():
+    st = A.new_state(NOW - pd.Timedelta("1D"), CFG)
+    acct = st["accounts"]["models"]
+    acct["cash"] = 900.0
+    acct["positions"] = [{"config": "ETHUSDT_1h_h4", "symbol": "ETHUSDT", "interval": "1h", "hold": "4 hours",
+                          "opened": (NOW - pd.Timedelta("10h")).isoformat(), "entry_price": 10.0, "qty": 10.0,
+                          "invested": 100.0, "fee": 0.0, "exit_time": (NOW - pd.Timedelta("6h")).isoformat(),
+                          "confidence": 0.6, "verdict": "NO EDGE"}]
+    idx = pd.date_range(NOW - pd.Timedelta("12h"), NOW, freq="1h")
+    closes = {("ETHUSDT", "1h"): pd.Series(np.arange(len(idx), dtype=float) + 5.0, index=idx),
+              ("SOLUSDT", "1h"): pd.Series(np.full(len(idx), 20.0), index=idx)}
+    t1, t2, t3 = NOW - pd.Timedelta("5h"), NOW - pd.Timedelta("4h"), NOW - pd.Timedelta("1h")
+
+    def call(t, hold="2h"):
+        return {"config": "SOLUSDT_1h_h2", "symbol": "SOLUSDT", "interval": "1h", "hold": "2 hours",
+                "signal_time": t.isoformat(), "exit_time": (t + pd.Timedelta(hold)).isoformat(), "price": 20.0,
+                "confidence": 0.7, "verdict": "NO EDGE", "fee": 0.0}
+
+    ev = A.catch_up_models(st, [call(t1), call(t2), call(t3)], closes, NOW, 0.10)
+    kinds = [(e["kind"], (e.get("trade") or e.get("position"))["symbol"]) for e in ev]
+    # ETH sold at the close at its exit time (6 h ago -> 11.0), not at today's price;
+    # SOL bought at t1, the t2 call skipped (still holding), sold at t1+2h, bought again at t3 (still open).
+    assert kinds == [("sell", "ETHUSDT"), ("buy", "SOLUSDT"), ("sell", "SOLUSDT"), ("buy", "SOLUSDT")]
+    assert ev[0]["trade"]["exit_price"] == 11.0 and ev[0]["trade"]["replayed"]
+    assert len(acct["positions"]) == 1 and acct["positions"][0]["opened"] == t3.isoformat()
+    # The live scan seeing the t3 candle afterwards does not buy it twice.
+    live = row(symbol="SOLUSDT", interval="1h", horizon=2, hold="2 hours", signal_time=t3)
+    assert A.step_models(st, [live], {"SOLUSDT": 20.0}, {"SOLUSDT_1h_h2": 0.0}, NOW, 0.10) == []
+
+
+def test_catch_up_rebalances_the_trend_account_for_each_missed_day():
+    st = A.new_state(NOW - pd.Timedelta("5D"), CFG)
+    st["accounts"]["trend"]["rebalanced_for"] = (NOW.floor("D") - pd.Timedelta("3D")).isoformat()
+    data = {"BTCUSDT": daily(0.004), "ETHUSDT": daily(-0.004)}
+    n = A.catch_up_trend(st, lambda s: data[s], NOW.floor("D"))
+    assert n == 2
+    missed = {(NOW.floor("D") - pd.Timedelta(f"{k}D")).isoformat() for k in (1, 2)}
+    assert st["accounts"]["trend"]["rebalanced_for"] == (NOW.floor("D") - pd.Timedelta("1D")).isoformat()
+    trades = st["accounts"]["trend"]["trades"]
+    assert {tr["time"] for tr in trades} <= missed and trades[0]["time"] == min(missed)
+    btc = [tr for tr in trades if tr["symbol"] == "BTCUSDT"][0]          # bought at that day's close
+    assert btc["price"] == pytest.approx(float(data["BTCUSDT"]["close"][pd.Timestamp(btc["time"])]))
+
+
+def test_run_once_after_a_pause_replays_and_reports_once(tmp_path):
+    first = NOW - pd.Timedelta("10h")
+    run(tmp_path, first)
+    sent = []
+    t = NOW - pd.Timedelta("3h")
+    missed = [{"config": "SOLUSDT_1h_h4", "symbol": "SOLUSDT", "interval": "1h", "hold": "4 hours",
+               "signal_time": t.isoformat(), "exit_time": (t + pd.Timedelta("4h")).isoformat(), "price": 150.0,
+               "confidence": 0.7, "verdict": "NO EDGE", "fee": 0.001}]
+    st = A.run_once(now=NOW, path=tmp_path / "state.json", scan_fn=lambda: [],
+                    daily_fn=lambda s: daily(0.004 if s == "BTCUSDT" else -0.004, end=NOW.floor("D")),
+                    prices_fn=lambda syms: {"BTCUSDT": 100.0, "ETHUSDT": 10.0, "SOLUSDT": 150.0},
+                    costs_fn=lambda: {"SOLUSDT_1h_h4": 0.001}, notify=sent.append, cfg=CFG,
+                    replay_fn=lambda since, until, costs: (missed, {}))
+    pos = st["accounts"]["models"]["positions"]
+    assert len(pos) == 1 and pos[0]["replayed"] and pos[0]["opened"] == t.isoformat()
+    assert sum("was off for 10 hours" in m for m in sent) == 1
+    assert not any(m.startswith("🟢 Pretend BUY") for m in sent)    # replayed trades: summed up, not spammed

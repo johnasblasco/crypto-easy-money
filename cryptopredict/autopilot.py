@@ -36,14 +36,16 @@ import pandas as pd
 import requests
 
 from . import trend_guide as TG
-from .data import BINANCE_HOSTS, DATA_DIR, INTERVAL_MS
+from .data import BINANCE_HOSTS, DATA_DIR, INTERVAL_MS, load_data
 from .experiments import EXPERIMENTS_DIR
-from .scanner import VALIDATED, format_price, scan, send_alert
+from .scanner import VALIDATED, format_duration, format_price, hold_time, load_configs, scan, send_alert
 
 STATE_PATH = DATA_DIR / "autopilot" / "state.json"
 TREND_FEE = 0.001 + 0.0003        # spot taker fee + 3 bp spread floor, as in the trend research
 EQUITY_EVERY = pd.Timedelta(hours=1)
 STALE_AFTER = pd.Timedelta(minutes=45)   # no update for this long -> the dashboard says it is off
+CATCH_UP_AFTER = pd.Timedelta(minutes=40)   # updates run every 15 minutes: a longer gap means it was off
+CATCH_UP_MAX = pd.Timedelta(days=14)        # missed time older than this is not replayed
 GO_LIVE_DAYS, GO_LIVE_TRADES = 90, 30
 MAX_HISTORY = 3000
 
@@ -212,11 +214,13 @@ def step_models(state: dict, rows: list[dict], prices: dict, costs: dict, now: p
     return events
 
 
-def step_trend(state: dict, prices: dict, now: pd.Timestamp, broker=PaperBroker()) -> list[dict]:
+def step_trend(state: dict, prices: dict, now: pd.Timestamp, broker=PaperBroker(),
+               guide: list | None = None, day: str | None = None) -> list[dict]:
     """Once per new daily guide: hold equity x exposure / number of coins in each coin."""
     acct = state["accounts"]["trend"]
-    guide = state["guide"]
-    if not guide or acct["rebalanced_for"] == state["guide_day"]:
+    guide = guide if guide is not None else state["guide"]
+    day = day or state["guide_day"]
+    if not guide or acct["rebalanced_for"] == day:
         return []
     coins = state["coins"]
     equity = account_value(acct, prices)
@@ -245,7 +249,7 @@ def step_trend(state: dict, prices: dict, now: pd.Timestamp, broker=PaperBroker(
             events.append({"time": now.isoformat(), "symbol": sym, "side": "buy", "usdt": spend, "price": price})
     acct["holdings"] = {s: q for s, q in acct["holdings"].items() if q > 1e-12}
     acct["trades"] = (acct["trades"] + events)[-MAX_HISTORY:]
-    acct["rebalanced_for"] = state["guide_day"]
+    acct["rebalanced_for"] = day
     return events
 
 
@@ -260,6 +264,131 @@ def step_hold(state: dict, prices: dict, broker=PaperBroker()) -> None:
     each = acct["cash"] / len(priced)
     for sym in priced:
         acct["holdings"][sym] = broker.buy(acct, each, prices[sym], TREND_FEE)
+
+
+# ------------------------------------------------------------------ catching up after a pause
+
+def replay_calls(configs: list[dict], since: pd.Timestamp, until: pd.Timestamp, costs: dict,
+                 load=None) -> tuple[list[dict], dict]:
+    """What the live scan would have seen while the autopilot was off.
+
+    Returns every confident UP call each Binance-trained model made on candles that closed in
+    (since, until] (signal at the candle's close, entry at that close, the same rule as live),
+    and the candle closes by (symbol, interval), to price the sells at their exit times.
+    """
+    from .features import add_features
+    from .predict import load_bundle
+
+    load = load or (lambda sym, interval, n: load_data("binance", sym, interval, n, save=False))
+    calls, closes, candles = [], {}, {}
+    for cfg in configs:
+        name = config_name(cfg)
+        if name not in costs:
+            continue
+        step = pd.Timedelta(milliseconds=INTERVAL_MS[cfg["interval"]])
+        hold = hold_time(cfg["interval"], cfg["horizon"])
+        key = (cfg["symbol"], cfg["interval"])
+        try:
+            if key not in candles:
+                candles[key] = load(cfg["symbol"], cfg["interval"], int((until - since) / step) + cfg["horizon"] + 400)
+                df = candles[key]
+                closes[key] = pd.Series(df["close"].to_numpy(float), index=pd.DatetimeIndex(df["timestamp"]) + step)
+            bundle = cfg.get("bundle") or load_bundle(cfg["path"])
+            feats = add_features(candles[key]).dropna(subset=bundle["features"])
+        except Exception:                 # one model failing must not stop the others
+            continue
+        close_at = feats["timestamp"] + step
+        window = feats[(close_at > since) & (close_at <= until)]
+        if window.empty:
+            continue
+        prob_up = bundle["model"].predict_proba(window[bundle["features"]].astype(float))[:, 1]
+        need = max(0.5, bundle.get("threshold", 0.5))      # an UP call at or above the model's own threshold
+        for ts, close, p in zip(window["timestamp"], window["close"], prob_up):
+            if p < need:
+                continue
+            signal = pd.Timestamp(ts) + step
+            calls.append({"config": name, "symbol": cfg["symbol"], "interval": cfg["interval"],
+                          "hold": format_duration(hold), "signal_time": signal.isoformat(),
+                          "exit_time": (signal + hold).isoformat(), "price": float(close), "confidence": float(p),
+                          "verdict": cfg["verdict"], "fee": costs[name]})
+    return calls, closes
+
+
+def catch_up_models(state: dict, calls: list[dict], closes: dict, until: pd.Timestamp, share: float,
+                    broker=PaperBroker()) -> list[dict]:
+    """Replay the missed time in order: sell each trade at the candle close at its exit time, copy each call."""
+    acct = state["accounts"]["models"]
+    seen = list(state["seen_signals"])
+    seen_set = set(seen)
+    events = []
+
+    def exit_price(p):
+        s = closes.get((p["symbol"], p["interval"]))
+        s = s[s.index <= pd.Timestamp(p["exit_time"])] if s is not None else None
+        return float(s.iloc[-1]) if s is not None and len(s) else None
+
+    def sell_due(t):
+        keep = []
+        for p in sorted(acct["positions"], key=lambda p: p["exit_time"]):
+            price = exit_price(p) if pd.Timestamp(p["exit_time"]) <= t else None
+            if price is None:
+                keep.append(p)
+                continue
+            got = broker.sell(acct, p["qty"], price, p["fee"])
+            trade = {**p, "closed": p["exit_time"], "exit_price": price, "proceeds": got,
+                     "pnl": got - p["invested"], "pnl_pct": got / p["invested"] - 1, "replayed": True}
+            acct["trades"].append(trade)
+            events.append({"kind": "sell", "trade": trade})
+        acct["positions"] = keep
+
+    for c in sorted(calls, key=lambda c: c["signal_time"]):
+        sell_due(pd.Timestamp(c["signal_time"]))            # sells free their cash before the next buy
+        key = f"{c['config']}|{c['signal_time']}"
+        if key in seen_set or c["config"] in {p["config"] for p in acct["positions"]}:
+            continue
+        seen.append(key)
+        seen_set.add(key)
+        invest = min(acct["start_cash"] * share, acct["cash"])
+        if invest < 1:
+            events.append({"kind": "skip", "text": f"no pretend cash left for {c['symbol']} {c['interval']}"})
+            continue
+        qty = broker.buy(acct, invest, c["price"], c["fee"])
+        pos = {"config": c["config"], "symbol": c["symbol"], "interval": c["interval"], "hold": c["hold"],
+               "opened": c["signal_time"], "entry_price": c["price"], "qty": qty, "invested": invest, "fee": c["fee"],
+               "exit_time": c["exit_time"], "confidence": c["confidence"], "verdict": c["verdict"], "replayed": True}
+        acct["positions"].append(pos)
+        events.append({"kind": "buy", "position": pos})
+    sell_due(until)
+    state["seen_signals"] = seen[-MAX_HISTORY:]
+    return events
+
+
+def catch_up_trend(state: dict, daily, today: pd.Timestamp, broker=PaperBroker()) -> int:
+    """Rebalance the trend account for every daily decision it missed, at that day's close."""
+    acct = state["accounts"]["trend"]
+    if not acct.get("rebalanced_for"):
+        return 0
+    days = pd.date_range(pd.Timestamp(acct["rebalanced_for"]) + pd.Timedelta("1D"), today - pd.Timedelta("1D"),
+                         freq="1D")[-CATCH_UP_MAX.days:]
+    for day in days:
+        guide = TG.guide(state["coins"], daily, day)
+        prices = {c["symbol"]: c["price"] for c in guide if c.get("price") is not None}
+        step_trend(state, prices, day, broker, guide=guide, day=day.isoformat())
+    return len(days)
+
+
+def catch_up_text(gap: pd.Timedelta, events: list[dict], trend_days: int) -> str:
+    hours = gap.total_seconds() / 3600
+    off = f"{hours:.0f} hours" if hours < 48 else f"{hours / 24:.0f} days"
+    sells = [e["trade"] for e in events if e["kind"] == "sell"]
+    buys = sum(e["kind"] == "buy" for e in events)
+    lines = [f"⏸ Autopilot was off for {off}. It caught up as if it had been running:"]
+    lines.append(f"• model calls: {buys} pretend buys, {len(sells)} sells"
+                 + (f" ({sum(t['pnl'] for t in sells):+,.2f} USDT)" if sells else ""))
+    lines.append(f"• trend guide: rebalanced for {trend_days} missed day(s)")
+    if gap > CATCH_UP_MAX:
+        lines.append(f"Only the last {CATCH_UP_MAX.days} days were replayed.")
+    return "\n".join(lines)
 
 
 # ------------------------------------------------------------------ reports and checks
@@ -336,15 +465,27 @@ def trade_text(event: dict) -> str:
 # ------------------------------------------------------------------ one update
 
 def run_once(now: pd.Timestamp | None = None, path: Path = STATE_PATH, scan_fn=scan, daily_fn=daily_bars,
-             prices_fn=latest_prices, costs_fn=model_costs, notify=send_alert, cfg: dict | None = None) -> dict:
+             prices_fn=latest_prices, costs_fn=model_costs, notify=send_alert, cfg: dict | None = None,
+             replay_fn=None) -> dict:
     now = now or pd.Timestamp.now(tz="UTC")
     cfg = cfg or settings()
     state = load_state(path) or new_state(now, cfg)
     log = []
     messages = []
     today = now.floor("D").isoformat()
+    last_run = pd.Timestamp(state["last_run"]) if state.get("last_run") else None
+    gap = now - last_run if last_run is not None else pd.Timedelta(0)
+    catching_up = gap > CATCH_UP_AFTER
+    days_cache: dict = {}
+
+    def daily(sym):
+        if sym not in days_cache:
+            days_cache[sym] = daily_fn(sym)
+        return days_cache[sym]
+
+    trend_days = catch_up_trend(state, daily, now.floor("D")) if catching_up else 0
     if state["guide_day"] != today:                  # the daily rule decides once per UTC day
-        new_guide = TG.guide(state["coins"], daily_fn, now)
+        new_guide = TG.guide(state["coins"], daily, now)
         messages += TG.changes(state["guide"], new_guide)
         state["guide"] = new_guide
         if not any(c["trend"] == "ERROR" for c in new_guide):
@@ -368,7 +509,24 @@ def run_once(now: pd.Timestamp | None = None, path: Path = STATE_PATH, scan_fn=s
     calls = {r["symbol"] for r in rows if r.get("direction") == "UP"} - set(state["prices"])
     if calls:
         state["prices"].update(prices_fn(calls))
-    events = step_models(state, rows, state["prices"], costs_fn(), now, cfg["trade_share"])
+    costs = costs_fn()
+    events = []
+    if catching_up:
+        since = max(last_run, now - CATCH_UP_MAX)
+        try:
+            if replay_fn is None:
+                missed, closes = replay_calls(load_configs(EXPERIMENTS_DIR), since, now, costs)
+            else:
+                missed, closes = replay_fn(since, now, costs)
+            events = catch_up_models(state, missed, closes, now, cfg["trade_share"])
+        except Exception as exc:
+            log.append(f"could not replay the missed model calls: {exc}")
+        messages.append(catch_up_text(gap, events, trend_days))
+        log.append(f"caught up {gap}: {len(events)} replayed trades, {trend_days} trend day(s)")
+        unpriced = {p["symbol"] for p in state["accounts"]["models"]["positions"]} - set(state["prices"])
+        if unpriced:
+            state["prices"].update(prices_fn(unpriced))
+    events += step_models(state, rows, state["prices"], costs, now, cfg["trade_share"])
     log += [e["text"] for e in events if e["kind"] == "skip"]
 
     for acct in state["accounts"].values():
@@ -376,8 +534,9 @@ def run_once(now: pd.Timestamp | None = None, path: Path = STATE_PATH, scan_fn=s
         if last is None or now - last >= EQUITY_EVERY or events:
             acct["equity"] = (acct["equity"] + [[now.isoformat(), round(account_value(acct, state["prices"]), 4)]])[-MAX_HISTORY:]
 
-    if cfg["trade_alerts"]:
-        messages += [trade_text(e) for e in events if e["kind"] in ("buy", "sell")]
+    if cfg["trade_alerts"]:                          # replayed trades are summed up in the catch-up message
+        messages += [trade_text(e) for e in events if e["kind"] in ("buy", "sell")
+                     and not (e.get("position") or e.get("trade") or {}).get("replayed")]
     if now.hour >= cfg["report_hour"] and state["last_report"] != today:
         messages.append(report_text(state, now))
         state["last_report"] = today

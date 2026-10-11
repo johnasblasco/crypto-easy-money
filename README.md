@@ -211,6 +211,20 @@ Without Docker, run `python -m cryptopredict.autopilot --watch 15` next to the d
 - **Start again:** `python -m cryptopredict.autopilot --reset` deletes the pretend accounts and starts fresh with new money.
 - **Pretend trades:** the model-calls account needs the scanner's models (`python -m cryptopredict.experiments`). The other two accounts work right away.
 
+**When your PC or Docker is off.** Nothing is sold and nothing resets: the
+pretend coins stay in the accounts, so their value moves with the market like a
+real wallet. When the autopilot comes back, it catches up **as if it had been
+running**. From Binance's price history it replays:
+- every confident call the models made on the missed candles, bought at that candle's close;
+- every sell at the real price at its exit time;
+- every missed daily trend rebalance at that day's close.
+
+The dashboard marks those trades "caught up", and you get one message summing
+them up. Up to 14 days are replayed.
+
+A real-money bot can't catch up like that: it has to be running to trade. When
+going live, run it on an always-on machine.
+
 **Phone alerts.** Set the same Telegram or Discord settings as the scanner in
 `.env`. You then get:
 - a message when a coin's trend turns up or down;

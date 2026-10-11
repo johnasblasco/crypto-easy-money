@@ -689,9 +689,118 @@
   $("plan-suggest").addEventListener("click", () => checkPlan(true));
   $("plan-clear").addEventListener("click", clearPlan);
 
+  // ------------------------------------------------------------ autopilot (pretend money)
+  const AP_COLORS = { models: "--series-1", trend: "--series-2", hold: "--text-muted" };
+  let apChart = null;
+  let apSeries = {};
+  let lastAutopilot = null;
+  const unix = (iso) => Math.floor(Date.parse(iso) / 1000);
+  const fmtShort = (iso) => new Date(iso).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+
+  function renderApChart(accounts) {
+    const el = $("ap-chart");
+    if (!apChart) {
+      apChart = LightweightCharts.createChart(el, {
+        ...chartOptions(el.clientHeight, false),
+        localization: { priceFormatter: (v) => v.toFixed(0) },
+      });
+      apSeries = {};
+      new ResizeObserver(() => apChart && apChart.applyOptions({ width: el.clientWidth })).observe(el);
+    }
+    accounts.forEach((a) => {
+      if (!apSeries[a.key]) {
+        apSeries[a.key] = apChart.addLineSeries({ color: css(AP_COLORS[a.key] || "--text-muted"), lineWidth: 2,
+          priceLineVisible: false, lastValueVisible: true, title: "" });
+      }
+      const pts = [];
+      a.equity.forEach(([t, v]) => {
+        const time = unix(t);
+        if (!pts.length || time > pts[pts.length - 1].time) pts.push({ time, value: v });
+      });
+      apSeries[a.key].setData(pts);
+    });
+    apChart.timeScale().fitContent();
+  }
+
+  function renderAutopilot(d) {
+    lastAutopilot = d;
+    const off = $("ap-off");
+    $("ap-badge").textContent = d.running ? "running" : "off";
+    $("ap-time").textContent = d.last_run ? `· updated ${fmtTime(d.last_run)}` : "";
+    const startCmd = "<code>docker compose up -d</code> (without Docker: <code>python -m cryptopredict.autopilot --watch 15</code>)";
+    if (!d.started) {
+      off.innerHTML = `The autopilot hasn't run yet. It starts together with the dashboard: ${startCmd}. ` +
+        "Run <code>docker compose build</code> first if you updated the code.";
+      off.hidden = false;
+      $("ap-body").hidden = true;
+      return;
+    }
+    off.hidden = d.running;
+    off.innerHTML = d.running ? "" : `The autopilot is not running (last update ${fmtTime(d.last_run)}). Start it with ${startCmd}.`;
+    $("ap-body").hidden = false;
+
+    $("ap-accounts").innerHTML = d.accounts
+      .map((a) => `<div class="ap-account"><div class="name"><i class="ap-dot" style="background:${css(AP_COLORS[a.key] || "--text-muted")}"></i>${esc(a.name)}</div>` +
+        `<div class="value">${fmtMoney(a.value)} <span class="muted">USDT</span></div>` +
+        `<div class="ret ${a.return >= 0 ? "up" : "down"}">${fmtSignedPct(a.return)} <span class="muted">since ${fmtDay(d.started)}</span></div></div>`)
+      .join("");
+    renderApChart(d.accounts);
+
+    $("ap-guide-time").textContent = d.guide_day ? `· ${fmtDay(d.guide_day)}` : "";
+    $("ap-guide").innerHTML = d.guide
+      .map((c) => {
+        const name = esc(baseAsset(c.symbol));
+        const trend = c.trend === "UP" ? '<span class="up">▲ UP</span>' : c.trend === "DOWN" ? '<span class="down">▼ DOWN</span>'
+          : `<span class="muted">${esc(c.trend.toLowerCase())}</span>`;
+        const keep = c.exposure == null ? "—" : `<b>${fmtPct(c.exposure, 0)}</b>`;
+        return `<tr title="${esc(c.reason || "")}"><td>${name}</td><td>${trend}</td><td>${keep}</td><td>${c.price == null ? "—" : fmtPrice(c.price)}</td></tr>`;
+      })
+      .join("");
+
+    const rows = d.open_trades.map((t) => ({ ...t, open: true })).concat(d.recent_trades);
+    $("ap-trades").innerHTML = rows.length
+      ? rows.slice(0, 15).map((t) => {
+          const res = t.pnl_pct;
+          const status = t.open ? `holding, sells ${fmtShort(t.exit_time)}` : `sold ${fmtShort(t.closed)}`;
+          const now = t.open ? (t.price == null ? "—" : fmtPrice(t.price)) : fmtPrice(t.exit_price);
+          return `<tr><td>${esc(baseAsset(t.symbol))} <span class="muted">${esc(t.interval)}</span></td><td>${esc(status)}</td>` +
+            `<td>${fmtPrice(t.entry_price)}</td><td>${now}</td><td class="${res >= 0 ? "up" : "down"}">${fmtSignedPct(res)}</td></tr>`;
+        }).join("")
+      : '<tr><td colspan="5">No pretend trades yet.</td></tr>';
+    $("ap-trades-note").innerHTML =
+      "It buys when a token model from the market scanner makes a confident UP call, holds for the model's hold time, " +
+      "then sells (fees included). If the scanner is empty, train the models first: " +
+      "<code>docker compose run --rm web python -m cryptopredict.experiments --jobs 2</code>.";
+
+    $("ap-checks").innerHTML = d.checks
+      .map((c) => `<li class="${c.ok ? "ok" : "no"}">${c.ok ? "✓" : "✗"} ${esc(c.label)} <span class="muted">(${esc(c.detail)})</span></li>`)
+      .join("");
+    $("ap-log").textContent = d.log.length ? `Recent notes: ${d.log.slice(-3).join(" · ")}` : "";
+  }
+
+  async function loadAutopilot() {
+    try {
+      const res = await fetch("/api/autopilot");
+      const body = await res.json();
+      if (!res.ok) throw new Error(body.detail || res.statusText);
+      renderAutopilot(body);
+    } catch (err) {
+      $("ap-off").textContent = `Could not load the autopilot: ${err.message}`;
+      $("ap-off").hidden = false;
+    }
+  }
+
+  window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+    if (apChart) apChart.remove();
+    apChart = null;
+    if (lastAutopilot && lastAutopilot.started) renderAutopilot(lastAutopilot);
+  });
+
   createCharts();
   load(false);
   loadEngine();
+  loadAutopilot();
+  setInterval(loadAutopilot, REFRESH_MS);
   setInterval(loadEngine, 5 * REFRESH_MS);
   loadScanner();
   setInterval(() => load(true), REFRESH_MS);

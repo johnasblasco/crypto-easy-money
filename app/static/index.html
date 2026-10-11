@@ -31,6 +31,48 @@
       </div>
     </section>
 
+    <section class="card wide" id="autopilot-card">
+      <div class="scanner-head">
+        <h2>Autopilot <span class="muted">· pretend money</span> <span class="muted" id="ap-time"></span></h2>
+        <span class="badge" id="ap-badge">off</span>
+      </div>
+      <p class="note ap-intro">Three pretend accounts start with the same money and trade by themselves with real prices
+        and fees: one copies every confident model call, one follows the trend guide, one just buys and holds.
+        No real money is used. Watch them for a few months before trusting any of it.</p>
+      <div id="ap-off" class="ap-off" hidden></div>
+      <div id="ap-body" hidden>
+        <div class="ap-accounts" id="ap-accounts"></div>
+        <div id="ap-chart" class="chart ap-chart" role="img" aria-label="Value of the three pretend accounts over time"></div>
+        <div class="ap-grid">
+          <div>
+            <h3>Trend guide <span class="muted" id="ap-guide-time"></span></h3>
+            <div class="table-scroll">
+              <table class="models ap-guide">
+                <thead><tr><th>Coin</th><th>Trend</th><th>Keep in coin</th><th>Price</th></tr></thead>
+                <tbody id="ap-guide"></tbody>
+              </table>
+            </div>
+            <p class="note">Of the money you set aside for a coin, keep this share in the coin and the rest in USDT.
+              It updates once a day after 00:00 UTC. It is a risk tool: on the unseen test year it cut the worst drop
+              of the main coins from −54% to −22%, but it did not make money in that falling year.</p>
+          </div>
+          <div>
+            <h3>Pretend trades <span class="muted">· copying the model calls</span></h3>
+            <div class="table-scroll">
+              <table class="models ap-trades">
+                <thead><tr><th>Coin</th><th>Status</th><th>Bought at</th><th>Now / sold at</th><th>Result</th></tr></thead>
+                <tbody id="ap-trades"></tbody>
+              </table>
+            </div>
+            <p class="note" id="ap-trades-note"></p>
+          </div>
+        </div>
+        <h3>Before using real money</h3>
+        <ul class="ap-checks" id="ap-checks"></ul>
+        <p class="note" id="ap-log"></p>
+      </div>
+    </section>
+
     <section class="card wide" id="engine-card">
       <div class="scanner-head">
         <h2>Signal engine <span class="muted" id="engine-time"></span></h2>

@@ -174,6 +174,72 @@ Notes:
 - **`toomanyrequests` while building:** Docker Hub has rate-limited image pulls. Set `BASE_IMAGE=mirror.gcr.io/library/python:3.13-slim` in `.env` and build again.
 - **Pinned versions:** the image installs the exact package versions the tests passed with (`constraints.txt`). For the same versions natively, use Python 3.12 or newer (tested on 3.13) and run `pip install -r requirements.txt -c constraints.txt`. On older Python, use plain `requirements.txt`.
 
+## Autopilot: pretend trading and the trend guide
+
+The **Autopilot** card at the top of the dashboard runs three pretend accounts.
+Each starts with 1,000 USDT and trades by itself at real Binance prices, with fees:
+
+| Account | What it does |
+|---|---|
+| **Copy the model calls** | Whenever a token model from the market scanner makes a confident UP call, it buys 10% of the starting money. It holds for the model's hold time, then sells. |
+| **Follow the trend guide** | It splits the money equally over the coins and keeps in each the share the trend guide says. It rebalances once a day. |
+| **Just buy and hold** | It buys the coins equally on day one and never trades. This is the yardstick. |
+
+No real money and no exchange account are involved. The point is to see, live and
+over months, whether copying the signals would have made money after fees,
+before risking any.
+
+**Trend guide.** For each coin it shows a "keep in coin" share. Of the money you
+set aside for that coin, keep that share in the coin and the rest in USDT. It
+comes from the one rule that held up on unseen data, and it is a risk tool, not
+a profit machine:
+- On the test year it had never seen, it cut the worst drop of the main coins from −54% to −22%.
+- On meme coins, it cut the worst drop from −94% to −28%.
+- It still lost money in that falling year.
+
+It updates once a day after 00:00 UTC. It needs no extra downloads: it reads 400 daily candles per coin from Binance.
+
+**Running it.** It starts together with the dashboard:
+
+```bash
+docker compose build        # after a git pull
+docker compose up -d        # dashboard + autopilot (updates every 15 minutes)
+```
+
+Without Docker, run `python -m cryptopredict.autopilot --watch 15` next to the dashboard.
+
+- **Start again:** `python -m cryptopredict.autopilot --reset` deletes the pretend accounts and starts fresh with new money.
+- **Pretend trades:** the model-calls account needs the scanner's models (`python -m cryptopredict.experiments`). The other two accounts work right away.
+
+**Phone alerts.** Set the same Telegram or Discord settings as the scanner in
+`.env`. You then get:
+- a message when a coin's trend turns up or down;
+- a daily report of the three accounts;
+- with `AUTOPILOT_TRADE_ALERTS=1`, every pretend trade.
+
+**Settings** (`.env`):
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `AUTOPILOT_START_CASH` | Pretend money per account | `1000` |
+| `AUTOPILOT_TRADE_PCT` | % of the starting money per copied trade | `10` |
+| `AUTOPILOT_COINS` | Coins for the trend guide and the trend/hold accounts | the 16 main coins |
+| `AUTOPILOT_REPORT_HOUR` | Daily report after this hour (UTC) | `1` |
+| `AUTOPILOT_TRADE_ALERTS` | `1` = a message for every pretend trade | off |
+
+Changing the start cash or the coins applies after a `--reset`.
+
+**Before real money.** The card has a checklist:
+- at least 90 days of pretend trading;
+- at least 30 finished trades;
+- copying the calls beat buy & hold after fees;
+- the copied models passed the edge check.
+
+All orders go through one "broker" object (`PaperBroker` in
+`cryptopredict/autopilot.py`). Connecting a real exchange later means replacing
+that object with one that sends the same orders through the exchange's API. It is
+deliberately not built until the checklist is green.
+
 ## Research engine — `quant/`
 
 The `cryptopredict/` app above is the original classroom project. `quant/` is
@@ -493,6 +559,8 @@ cryptopredict/
   scanner.py     live BUY/AVOID/WAIT signals + Telegram/Discord alerts
   predict.py     next-candle prediction + CLI
   planner.py     entry / take-profit / stop-loss replay, break-even and position sizing
+  autopilot.py   pretend-money accounts that copy the signals, daily report and alerts
+  trend_guide.py daily "keep in coin" share from the frozen trend rule
 quant/           research harness and signal engine (see docs/RESEARCH_REPORT.md)
   data.py        1m kline download/load, quality report, Fear & Greed
   labels.py      next-minute VWAP fills, forward returns
@@ -507,7 +575,7 @@ quant/           research harness and signal engine (see docs/RESEARCH_REPORT.md
   build_engine.py one command: data, the studies the engine needs, train_engine
   studies/       every experiment, including the ones that failed
 app/
-  server.py      FastAPI backend (/api/dashboard, /api/scanner, /api/plan, /api/engine)
+  server.py      FastAPI backend (/api/dashboard, /api/scanner, /api/plan, /api/autopilot, /api/engine)
   static/        dashboard HTML/CSS/JS + vendored chart library
 tests/           unit and end-to-end tests
 ```

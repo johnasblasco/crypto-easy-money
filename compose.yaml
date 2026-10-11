@@ -1,4 +1,4 @@
-# Dashboard:      docker compose up -d            -> http://localhost:8000
+# Dashboard:      docker compose up -d            -> http://localhost:8000 (also starts the autopilot)
 # One-off jobs:   docker compose run --rm web python -m quant.data download
 # Phone alerts:   docker compose --profile alerts up -d
 # Book recorder:  docker compose --profile recorder up -d
@@ -30,6 +30,15 @@ services:
     ports:
       # Localhost only by default: the dashboard has no login. BIND_ADDR=0.0.0.0 in .env exposes it.
       - "${BIND_ADDR:-127.0.0.1}:${PORT:-8000}:8000"
+    restart: unless-stopped
+
+  autopilot:
+    # Pretend-money accounts + trend guide, updated every 15 minutes (starts with `docker compose up -d`).
+    <<: *app
+    command: ["python", "-m", "cryptopredict.autopilot", "--watch", "15"]
+    stop_signal: SIGINT
+    healthcheck:
+      disable: true
     restart: unless-stopped
 
   scanner:

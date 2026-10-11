@@ -272,6 +272,23 @@ td { font-variant-numeric: tabular-nums; }
 .plan-result .warn-text { color: var(--warning-text); }
 .plan-result .meta dt.up { color: var(--up-text); }
 .plan-result .meta dt.down { color: var(--down-text); }
+.ap-intro { margin: 0 0 12px; }
+.ap-off { font-size: 13px; color: var(--text-secondary); }
+.ap-off code, .note code { font-size: 12px; }
+.ap-accounts { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
+.ap-account { border: 1px solid var(--border); border-radius: 10px; padding: 12px; }
+.ap-account .name { font-size: 12px; color: var(--text-secondary); display: flex; align-items: center; gap: 6px; }
+.ap-account .value { font-size: 22px; font-weight: 600; margin-top: 2px; font-variant-numeric: tabular-nums; }
+.ap-account .ret { font-weight: 600; }
+.ap-dot { width: 10px; height: 3px; border-radius: 2px; display: inline-block; }
+.ap-chart { height: 180px; margin: 12px 0 4px; }
+.ap-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; margin-top: 12px; }
+.ap-grid h3, #ap-body > h3 { font-size: 14px; margin: 8px 0 6px; }
+.ap-guide td:nth-child(2), .ap-guide th:nth-child(2) { text-align: left; }
+.ap-trades td:nth-child(2), .ap-trades th:nth-child(2) { text-align: left; white-space: normal; min-width: 100px; }
+.ap-checks { list-style: none; padding: 0; margin: 0; font-size: 13px; display: grid; gap: 4px; }
+.ap-checks .ok { color: var(--up-text); }
+.ap-checks .no { color: var(--text-muted); }
 .footer { text-align: center; font-size: 12px; color: var(--text-muted); padding: 8px 16px 24px; }
 
 @media (max-width: 900px) {

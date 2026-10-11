@@ -269,6 +269,14 @@ def scanner():
     return _cached(("scanner", str(summary)), summary, SCAN_CACHE_SECONDS, build)
 
 
+@app.get("/api/autopilot")
+def autopilot_status():
+    """Pretend-money accounts and the trend guide, written by `python -m cryptopredict.autopilot`."""
+    from cryptopredict import autopilot
+
+    return _json_safe(autopilot.status(autopilot.STATE_PATH))
+
+
 # ------------------------------------------------------------ signal engine
 
 ENGINE_TTL_SECONDS = int(os.environ.get("ENGINE_TTL", 300))

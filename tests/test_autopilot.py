@@ -214,7 +214,8 @@ def test_replay_finds_the_calls_the_live_scan_would_have_seen():
     df = candles(until - pd.Timedelta("1h"))              # last candle closes exactly at `until`
     cfg = {"symbol": "SOLUSDT", "interval": "1h", "horizon": 2, "verdict": "NO EDGE",
            "bundle": {"features": ["close"], "threshold": 0.6, "model": CycleModel([0.7, 0.4, 0.55])}}
-    calls, closes = A.replay_calls([cfg], since, until, {"SOLUSDT_1h_h2": 0.001}, load=lambda s, i, n: df)
+    calls, closes, failed = A.replay_calls([cfg], since, until, {"SOLUSDT_1h_h2": 0.001}, load=lambda s, i, n: df)
+    assert failed == []
     times = [c["signal_time"] for c in calls]
     assert times and all(since < pd.Timestamp(t) <= until for t in times)
     assert all(c["confidence"] >= 0.6 for c in calls)               # 0.55 is UP but below its threshold
@@ -222,7 +223,12 @@ def test_replay_finds_the_calls_the_live_scan_would_have_seen():
     assert pd.Timestamp(first["exit_time"]) - pd.Timestamp(first["signal_time"]) == pd.Timedelta("2h")
     s = closes[("SOLUSDT", "1h")]
     assert s.index[-1] == until and first["price"] == s[pd.Timestamp(first["signal_time"])]
-    assert A.replay_calls([cfg], since, until, {}, load=lambda s, i, n: df) == ([], {})   # not a Binance model
+    assert A.replay_calls([cfg], since, until, {}, load=lambda s, i, n: df) == ([], {}, [])   # not a Binance model
+
+    def offline(s, i, n):
+        raise OSError("no network")
+
+    assert A.replay_calls([cfg], since, until, {"SOLUSDT_1h_h2": 0.001}, load=offline) == ([], {}, ["SOLUSDT_1h_h2"])
 
 
 def test_catch_up_sells_at_the_exit_time_price_and_copies_missed_calls():
@@ -259,8 +265,8 @@ def test_catch_up_rebalances_the_trend_account_for_each_missed_day():
     st = A.new_state(NOW - pd.Timedelta("5D"), CFG)
     st["accounts"]["trend"]["rebalanced_for"] = (NOW.floor("D") - pd.Timedelta("3D")).isoformat()
     data = {"BTCUSDT": daily(0.004), "ETHUSDT": daily(-0.004)}
-    n = A.catch_up_trend(st, lambda s: data[s], NOW.floor("D"))
-    assert n == 2
+    n, done = A.catch_up_trend(st, lambda s: data[s], NOW.floor("D"))
+    assert n == 2 and done
     missed = {(NOW.floor("D") - pd.Timedelta(f"{k}D")).isoformat() for k in (1, 2)}
     assert st["accounts"]["trend"]["rebalanced_for"] == (NOW.floor("D") - pd.Timedelta("1D")).isoformat()
     trades = st["accounts"]["trend"]["trades"]
@@ -281,8 +287,150 @@ def test_run_once_after_a_pause_replays_and_reports_once(tmp_path):
                     daily_fn=lambda s: daily(0.004 if s == "BTCUSDT" else -0.004, end=NOW.floor("D")),
                     prices_fn=lambda syms: {"BTCUSDT": 100.0, "ETHUSDT": 10.0, "SOLUSDT": 150.0},
                     costs_fn=lambda: {"SOLUSDT_1h_h4": 0.001}, notify=sent.append, cfg=CFG,
-                    replay_fn=lambda since, until, costs: (missed, {}))
+                    replay_fn=lambda since, until, costs: (missed, {}, []))
     pos = st["accounts"]["models"]["positions"]
     assert len(pos) == 1 and pos[0]["replayed"] and pos[0]["opened"] == t.isoformat()
     assert sum("was off for 10 hours" in m for m in sent) == 1
     assert not any(m.startswith("🟢 Pretend BUY") for m in sent)    # replayed trades: summed up, not spammed
+
+
+# ------------------------------------------------------------ review findings (regressions)
+
+def market_prices(market):
+    """Like Binance: returns only the symbols asked for (and only those it has)."""
+    return lambda syms: {s: market[s] for s in syms if s in market}
+
+
+def run_with(tmp_path, now, market, rows=(), sent=None, replay=None, daily_fn=None):
+    return A.run_once(now=now, path=tmp_path / "state.json", scan_fn=lambda: list(rows),
+                      daily_fn=daily_fn or (lambda s: daily(0.004 if s == "BTCUSDT" else -0.004, end=now.floor("D"))),
+                      prices_fn=market_prices(market), costs_fn=lambda: {"PEPEUSDT_1h_h4": 0.0},
+                      notify=(sent.append if sent is not None else (lambda t: None)), cfg=CFG,
+                      replay_fn=replay or (lambda since, until, costs: ([], {}, [])))
+
+
+def test_a_model_coin_outside_the_guide_is_never_bought_at_an_old_price(tmp_path):
+    market = {"BTCUSDT": 100.0, "ETHUSDT": 10.0, "PEPEUSDT": 1000.0}
+    t0 = NOW
+    run_with(tmp_path, t0, market, rows=[row(symbol="PEPEUSDT", signal_time=t0 - pd.Timedelta("5min"), price=1000.0)])
+    for k in range(1, 20):                                     # every 15 minutes: sold after 4 h at 1000
+        run_with(tmp_path, t0 + pd.Timedelta(minutes=15 * k), market)
+    market["PEPEUSDT"] = 800.0                                 # the coin falls while nothing is held
+    t1 = t0 + pd.Timedelta(minutes=15 * 20)
+    st = run_with(tmp_path, t1, market, rows=[row(symbol="PEPEUSDT", signal_time=t1 - pd.Timedelta("5min"), price=800.0)])
+    pos = st["accounts"]["models"]["positions"]
+    assert len(pos) == 1 and pos[0]["entry_price"] == 800.0     # not the 1000 left over from the last trade
+
+
+def test_offline_restart_after_a_pause_trades_nothing_and_retries_the_catch_up(tmp_path):
+    market = {"BTCUSDT": 100.0, "ETHUSDT": 10.0, "PEPEUSDT": 150.0}
+    run_with(tmp_path, NOW, market, rows=[row(symbol="PEPEUSDT", signal_time=NOW - pd.Timedelta("5min"))])
+    synced = A.load_state(tmp_path / "state.json")["synced_until"]
+    later = NOW + pd.Timedelta("3D")                           # the PC was off; it starts before the Wi-Fi
+    sent = []
+
+    def offline_replay(since, until, costs):
+        return [], {}, ["PEPEUSDT_1h_h4"]
+
+    st = run_with(tmp_path, later, {}, sent=sent, replay=offline_replay,
+                  daily_fn=lambda s: (_ for _ in ()).throw(OSError("offline")))
+    assert len(st["accounts"]["models"]["positions"]) == 1     # not sold at the pre-pause price
+    assert st["synced_until"] == synced and not any("caught up" in m for m in sent)
+    # Network back 15 minutes later: the catch-up runs, selling at the close at the exit time.
+    exit_time = pd.Timestamp(st["accounts"]["models"]["positions"][0]["exit_time"])
+    closes = {("PEPEUSDT", "1h"): pd.Series([120.0], index=[exit_time])}
+    st = run_with(tmp_path, later + pd.Timedelta("15min"), {**market, "PEPEUSDT": 90.0}, sent=sent,
+                  replay=lambda since, until, costs: ([], closes, []))
+    trade = st["accounts"]["models"]["trades"][-1]
+    assert trade["exit_price"] == 120.0 and trade["replayed"]
+    assert sum("caught up" in m for m in sent) == 1 and st["synced_until"] == (later + pd.Timedelta("15min")).isoformat()
+
+
+def test_trend_catch_up_stops_at_a_day_with_missing_data():
+    st = A.new_state(NOW - pd.Timedelta("5D"), CFG)
+    acct = st["accounts"]["trend"]
+    acct["rebalanced_for"] = (NOW.floor("D") - pd.Timedelta("3D")).isoformat()
+    acct["holdings"] = {"BTCUSDT": 2.0}
+
+    def flaky(sym):
+        if sym == "ETHUSDT":
+            raise OSError("timeout")
+        return daily(0.004)
+
+    n, done = A.catch_up_trend(st, flaky, NOW.floor("D"))
+    assert (n, done) == (0, False)
+    assert acct["holdings"] == {"BTCUSDT": 2.0} and acct["rebalanced_for"] == (NOW.floor("D") - pd.Timedelta("3D")).isoformat()
+
+
+def test_trend_and_hold_accounts_wait_for_every_price():
+    st = A.new_state(NOW, CFG)
+    A.step_hold(st, {"BTCUSDT": 100.0})                         # ETH has no price yet
+    assert st["accounts"]["hold"]["holdings"] == {} and st["accounts"]["hold"]["cash"] == 1000
+    st["guide"] = [{"symbol": "BTCUSDT", "exposure": 0.5, "trend": "UP"}, {"symbol": "ETHUSDT", "exposure": 0.5, "trend": "UP"}]
+    st["guide_day"] = NOW.floor("D").isoformat()
+    assert A.step_trend(st, {"BTCUSDT": 100.0}, NOW) is None
+    assert st["accounts"]["trend"]["rebalanced_for"] is None   # still due
+
+
+def test_go_live_needs_real_profit_not_just_losing_less_than_holding():
+    st = A.new_state(NOW - pd.Timedelta("120D"), CFG)
+    models = st["accounts"]["models"]
+    models["stats"] = {"count": 40, "validated": 40, "pnl": -50.0}
+    models["cash"] = 950.0                                      # lost 5%
+    st["accounts"]["hold"]["cash"] = 700.0                      # buy & hold lost 30%
+    money = A.go_live_checks(st, NOW)[2]
+    assert not money["ok"] and "-50.00 USDT" in money["detail"]
+    models["stats"]["pnl"], models["cash"] = 80.0, 1080.0
+    assert A.go_live_checks(st, NOW)[2]["ok"]
+
+
+def test_a_damaged_save_falls_back_to_the_previous_one(tmp_path):
+    p = tmp_path / "state.json"
+    first = A.new_state(NOW, CFG)
+    A.save_state(first, p)
+    second = {**first, "last_run": NOW.isoformat()}
+    A.save_state(second, p)                                     # the first save is now the backup
+    p.write_text('{"cut off by a power fail')
+    assert A.load_state(p)["last_run"] is None                  # dashboard read: backup, file untouched
+    assert p.exists()
+    assert A.load_state(p, repair=True)["last_run"] is None     # autopilot: backup, damaged file moved aside
+    assert not p.exists() and list(tmp_path.glob("state.json.corrupt-*"))
+
+
+def test_settings_tolerate_typing_variations(monkeypatch):
+    monkeypatch.setenv("AUTOPILOT_TRADE_PCT", "10%")
+    monkeypatch.setenv("AUTOPILOT_START_CASH", "1,500")
+    monkeypatch.setenv("AUTOPILOT_REPORT_HOUR", "ten")
+    monkeypatch.setenv("AUTOPILOT_TRADE_ALERTS", "true")
+    cfg = A.settings()
+    assert cfg["trade_share"] == 0.10 and cfg["start_cash"] == 1500 and cfg["trade_alerts"]
+    assert cfg["report_hour"] == 1 and len(cfg["notes"]) == 1 and "AUTOPILOT_REPORT_HOUR" in cfg["notes"][0]
+
+
+def test_trade_history_is_capped_but_totals_count_everything(monkeypatch):
+    monkeypatch.setattr(A, "MAX_HISTORY", 5)
+    acct = A.new_state(NOW, CFG)["accounts"]["models"]
+    for i in range(12):
+        A.record_trade(acct, {"pnl": 1.0, "verdict": "NO EDGE", "i": i})
+    assert len(acct["trades"]) == 5 and acct["trades"][-1]["i"] == 11
+    assert acct["stats"] == {"count": 12, "validated": 0, "pnl": 12.0}
+
+
+def test_a_guide_with_missing_data_keeps_the_last_complete_one_and_its_alerts(tmp_path):
+    sent = []
+    day1 = NOW
+    run_with(tmp_path, day1, {"BTCUSDT": 100.0, "ETHUSDT": 10.0}, sent=sent,
+             daily_fn=lambda s: daily(-0.004, end=day1.floor("D")))          # both DOWN on day 1
+    day2 = day1 + pd.Timedelta("1D")
+
+    def eth_fails(sym):
+        if sym == "ETHUSDT":
+            raise OSError("timeout")
+        return daily(0.004, end=day2.floor("D"))
+
+    st = run_with(tmp_path, day2, {"BTCUSDT": 100.0, "ETHUSDT": 10.0}, sent=sent, daily_fn=eth_fails)
+    assert st["guide_day"] == day1.floor("D").isoformat() and all(c["trend"] != "ERROR" for c in st["guide"])
+    sent.clear()
+    run_with(tmp_path, day2 + pd.Timedelta("15min"), {"BTCUSDT": 100.0, "ETHUSDT": 10.0}, sent=sent,
+             daily_fn=lambda s: daily(0.004, end=day2.floor("D")))
+    assert any("BTC trend turned UP" in m for m in sent)            # not lost to the failed attempt

@@ -220,7 +220,10 @@ running**. From Binance's price history it replays:
 - every missed daily trend rebalance at that day's close.
 
 The dashboard marks those trades "caught up", and you get one message summing
-them up. Up to 14 days are replayed.
+them up. Up to 14 days are replayed; longer pauses don't count toward the 90 days.
+
+If the internet isn't back yet when it restarts, it trades nothing and tries
+again 15 minutes later. It never buys, sells or values anything at an old price.
 
 A real-money bot can't catch up like that: it has to be running to trade. When
 going live, run it on an always-on machine.
@@ -246,7 +249,7 @@ Changing the start cash or the coins applies after a `--reset`.
 **Before real money.** The card has a checklist:
 - at least 90 days of pretend trading;
 - at least 30 finished trades;
-- copying the calls beat buy & hold after fees;
+- copying the calls made money and beat buy & hold, after fees;
 - the copied models passed the edge check.
 
 All orders go through one "broker" object (`PaperBroker` in

@@ -16,9 +16,14 @@ Three pretend accounts start with the same money (AUTOPILOT_START_CASH, default 
 * Buy & hold: buy the guide coins equally on the first day and never trade. The yardstick.
 
 Every pretend buy and sell pays the fee (and half a price tick for the model trades, as in
-their back-tests) at the latest Binance price. No real money and no exchange account are used.
-All orders go through ``PaperBroker``; connecting a real exchange later means swapping in a
-broker that sends the same orders, once the "before real money" checks pass.
+their back-tests) at a Binance price fetched in the same update; nothing is bought, sold or
+valued at an old price. No real money and no exchange account are used. All orders go through
+``PaperBroker``; connecting a real exchange later means swapping in a broker that sends the same
+orders, once the "before real money" checks pass.
+
+After a pause (PC or Docker off), the next update replays the missed time from Binance's price
+history as if it had been running, up to 14 days. If the market data can't be loaded, it trades
+nothing and retries on the next update.
 
 Alerts use the scanner's settings (TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID, DISCORD_WEBHOOK_URL):
 trend changes, a daily report (after AUTOPILOT_REPORT_HOUR UTC, default 1) and, with
@@ -29,6 +34,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import time
 from pathlib import Path
 
@@ -50,15 +56,30 @@ GO_LIVE_DAYS, GO_LIVE_TRADES = 90, 30
 MAX_HISTORY = 3000
 
 
+def _setting(name: str, default, cast, ok, notes: list):
+    raw = (os.environ.get(name) or "").strip().replace("%", "").replace(",", "")
+    if not raw:
+        return default
+    try:
+        value = cast(raw)
+        if ok(value):
+            return value
+    except ValueError:
+        pass
+    notes.append(f"ignored {name}={os.environ.get(name)!r} (not a valid value); using {default}")
+    return default
+
+
 def settings() -> dict:
     from quant.data import UNIVERSE
 
+    notes: list = []
     coins = [s.strip().upper() for s in (os.environ.get("AUTOPILOT_COINS") or "").split(",") if s.strip()]
-    return {"start_cash": float(os.environ.get("AUTOPILOT_START_CASH") or 1000),
-            "trade_share": float(os.environ.get("AUTOPILOT_TRADE_PCT") or 10) / 100,
-            "report_hour": int(os.environ.get("AUTOPILOT_REPORT_HOUR") or 1),
-            "trade_alerts": os.environ.get("AUTOPILOT_TRADE_ALERTS") == "1",
-            "coins": coins or list(UNIVERSE)}
+    return {"start_cash": _setting("AUTOPILOT_START_CASH", 1000.0, float, lambda v: v > 0, notes),
+            "trade_share": _setting("AUTOPILOT_TRADE_PCT", 10.0, float, lambda v: 0 < v <= 100, notes) / 100,
+            "report_hour": _setting("AUTOPILOT_REPORT_HOUR", 1, int, lambda v: 0 <= v <= 23, notes),
+            "trade_alerts": (os.environ.get("AUTOPILOT_TRADE_ALERTS") or "").strip().lower() in ("1", "true", "yes", "on"),
+            "coins": coins or list(UNIVERSE), "notes": notes}
 
 
 # ------------------------------------------------------------------ orders
@@ -87,24 +108,41 @@ def new_state(now: pd.Timestamp, cfg: dict) -> dict:
                 "equity": [], **extra}
 
     return {"version": 1, "started": now.isoformat(), "coins": cfg["coins"], "broker": PaperBroker.name,
-            "accounts": {"models": account("Copy the model calls", positions=[]),
+            "accounts": {"models": account("Copy the model calls", positions=[],
+                                           stats={"count": 0, "validated": 0, "pnl": 0.0}),
                          "trend": account("Follow the trend guide", holdings={}, rebalanced_for=None),
                          "hold": account("Just buy and hold", holdings={})},
             "seen_signals": [], "guide": None, "guide_day": None, "prices": {}, "last_report": None,
-            "last_run": None, "log": []}
+            "last_run": None, "synced_until": None, "uncovered_s": 0.0, "log": []}
 
 
-def load_state(path: Path = STATE_PATH) -> dict | None:
-    try:
-        return json.loads(path.read_text())
-    except FileNotFoundError:
-        return None
+def _backup(path: Path) -> Path:
+    return path.with_name(path.name + ".bak")
+
+
+def load_state(path: Path = STATE_PATH, repair: bool = False) -> dict | None:
+    """The saved accounts; falls back to the previous save if the file is damaged (e.g. a power cut)."""
+    for candidate in (path, _backup(path)):
+        try:
+            return json.loads(candidate.read_text())
+        except FileNotFoundError:
+            continue
+        except ValueError:
+            if repair:                     # keep the damaged file for inspection, out of the way
+                candidate.rename(candidate.with_name(f"{candidate.name}.corrupt-{int(time.time())}"))
+                print(f"{candidate} was damaged; moved it aside and used the previous save", flush=True)
+    return None
 
 
 def save_state(state: dict, path: Path = STATE_PATH) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(state, default=str))
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(json.dumps(state, default=str))
+        f.flush()
+        os.fsync(f.fileno())
+    if path.exists():
+        shutil.copyfile(path, _backup(path))
     os.replace(tmp, path)
 
 
@@ -117,10 +155,26 @@ def account_value(acct: dict, prices: dict) -> float:
     return value
 
 
+def account_symbols(acct: dict) -> set:
+    return set(acct.get("holdings", {})) | {p["symbol"] for p in acct.get("positions", [])}
+
+
+def record_trade(acct: dict, trade: dict) -> None:
+    """Keep the last MAX_HISTORY trades, and running totals over all of them for the checks."""
+    stats = acct.setdefault("stats", {"count": 0, "validated": 0, "pnl": 0.0})
+    stats["count"] += 1
+    stats["validated"] += trade.get("verdict") == VALIDATED
+    stats["pnl"] += trade["pnl"]
+    acct["trades"] = (acct["trades"] + [trade])[-MAX_HISTORY:]
+
+
 # ------------------------------------------------------------------ market data
 
 def latest_prices(symbols, timeout: float = 10.0) -> dict:
-    """Latest Binance spot prices, one request for all symbols (per symbol if the batch fails)."""
+    """Latest Binance spot prices, one request for all symbols (per symbol if the batch fails).
+
+    Returns only the prices it got; a symbol missing from the result means "no price now".
+    """
     symbols = sorted(set(symbols))
     if not symbols:
         return {}
@@ -170,7 +224,11 @@ def config_name(row: dict) -> str:
 
 def step_models(state: dict, rows: list[dict], prices: dict, costs: dict, now: pd.Timestamp,
                 share: float, broker=PaperBroker()) -> list[dict]:
-    """Sell finished pretend trades, then copy every new confident UP call. Returns the events."""
+    """Sell finished pretend trades, then copy every new confident UP call. Returns the events.
+
+    ``prices`` must hold only prices fetched in this update: a finished trade without one waits
+    for the next update, and a buy without one fills at the signal candle's close.
+    """
     acct = state["accounts"]["models"]
     events = []
     still = []
@@ -182,21 +240,23 @@ def step_models(state: dict, rows: list[dict], prices: dict, costs: dict, now: p
         got = broker.sell(acct, p["qty"], price, p["fee"])
         trade = {**p, "closed": now.isoformat(), "exit_price": price, "proceeds": got,
                  "pnl": got - p["invested"], "pnl_pct": got / p["invested"] - 1}
-        acct["trades"].append(trade)
+        record_trade(acct, trade)
         events.append({"kind": "sell", "trade": trade})
     acct["positions"] = still
     open_configs = {p["config"] for p in still}
     seen = list(state["seen_signals"])
+    seen_set = set(seen)
     for r in rows:
         if r.get("status") == "ERROR" or r.get("direction") != "UP" or r.get("confidence", 0) < r.get("threshold", 1):
             continue
         cfg = config_name(r)
         key = f"{cfg}|{r['signal_time']}"
         signal_age = now - pd.Timestamp(r["signal_time"])
-        if (key in seen or cfg in open_configs or cfg not in costs
+        if (key in seen_set or cfg in open_configs or cfg not in costs
                 or signal_age > pd.Timedelta(milliseconds=INTERVAL_MS[r["interval"]])):
             continue                       # already copied, still holding, not Binance data, or stale
         seen.append(key)
+        seen_set.add(key)
         invest = min(acct["start_cash"] * share, acct["cash"])
         if invest < 1:
             events.append({"kind": "skip", "text": f"no pretend cash left for {r['symbol']} {r['interval']}"})
@@ -215,24 +275,24 @@ def step_models(state: dict, rows: list[dict], prices: dict, costs: dict, now: p
 
 
 def step_trend(state: dict, prices: dict, now: pd.Timestamp, broker=PaperBroker(),
-               guide: list | None = None, day: str | None = None) -> list[dict]:
-    """Once per new daily guide: hold equity x exposure / number of coins in each coin."""
+               guide: list | None = None, day: str | None = None) -> list[dict] | None:
+    """Once per new daily guide: hold equity x exposure / number of coins in each coin.
+
+    Returns None (and stays due) if a coin has no price or no guide data: valuing it at 0 would
+    make the account sell the coins it should keep.
+    """
     acct = state["accounts"]["trend"]
     guide = guide if guide is not None else state["guide"]
     day = day or state["guide_day"]
     if not guide or acct["rebalanced_for"] == day:
         return []
     coins = state["coins"]
+    if any(s not in prices for s in set(coins) | set(acct["holdings"])) or any(c.get("trend") == "ERROR" for c in guide):
+        return None
     equity = account_value(acct, prices)
     targets = {c["symbol"]: equity * max(c.get("exposure") or 0.0, 0.0) / len(coins) for c in guide}
     events = []
-    orders = []
-    for sym in coins:
-        price = prices.get(sym)
-        if price is None:
-            continue
-        have = acct["holdings"].get(sym, 0.0) * price
-        orders.append((targets.get(sym, 0.0) - have, sym, price))
+    orders = [(targets.get(sym, 0.0) - acct["holdings"].get(sym, 0.0) * prices[sym], sym, prices[sym]) for sym in coins]
     for diff, sym, price in sorted(orders):          # sells (negative) first, to free cash for the buys
         if abs(diff) < 1:
             continue
@@ -254,33 +314,33 @@ def step_trend(state: dict, prices: dict, now: pd.Timestamp, broker=PaperBroker(
 
 
 def step_hold(state: dict, prices: dict, broker=PaperBroker()) -> None:
-    """Buy every guide coin equally once, then never trade."""
+    """Buy every guide coin equally once (when all of them have a price), then never trade."""
     acct = state["accounts"]["hold"]
-    if acct["holdings"]:
+    if acct["holdings"] or any(s not in prices for s in state["coins"]):
         return
-    priced = [s for s in state["coins"] if s in prices]
-    if not priced:
-        return
-    each = acct["cash"] / len(priced)
-    for sym in priced:
+    each = acct["cash"] / len(state["coins"])
+    for sym in state["coins"]:
         acct["holdings"][sym] = broker.buy(acct, each, prices[sym], TREND_FEE)
 
 
 # ------------------------------------------------------------------ catching up after a pause
 
 def replay_calls(configs: list[dict], since: pd.Timestamp, until: pd.Timestamp, costs: dict,
-                 load=None) -> tuple[list[dict], dict]:
+                 load=None, reach: dict | None = None) -> tuple[list[dict], dict, list[str]]:
     """What the live scan would have seen while the autopilot was off.
 
     Returns every confident UP call each Binance-trained model made on candles that closed in
     (since, until] (signal at the candle's close, entry at that close, the same rule as live),
-    and the candle closes by (symbol, interval), to price the sells at their exit times.
+    the candle closes by (symbol, interval) to price the sells at their exit times (back to
+    ``reach[(symbol, interval)]`` for trades opened before the pause), and the models whose
+    data could not be loaded.
     """
     from .features import add_features
     from .predict import load_bundle
 
     load = load or (lambda sym, interval, n: load_data("binance", sym, interval, n, save=False))
-    calls, closes, candles = [], {}, {}
+    reach = reach or {}
+    calls, closes, candles, failed = [], {}, {}, []
     for cfg in configs:
         name = config_name(cfg)
         if name not in costs:
@@ -290,12 +350,14 @@ def replay_calls(configs: list[dict], since: pd.Timestamp, until: pd.Timestamp, 
         key = (cfg["symbol"], cfg["interval"])
         try:
             if key not in candles:
-                candles[key] = load(cfg["symbol"], cfg["interval"], int((until - since) / step) + cfg["horizon"] + 400)
+                start = min(since, reach.get(key, since))
+                candles[key] = load(cfg["symbol"], cfg["interval"], int((until - start) / step) + cfg["horizon"] + 400)
                 df = candles[key]
                 closes[key] = pd.Series(df["close"].to_numpy(float), index=pd.DatetimeIndex(df["timestamp"]) + step)
             bundle = cfg.get("bundle") or load_bundle(cfg["path"])
             feats = add_features(candles[key]).dropna(subset=bundle["features"])
-        except Exception:                 # one model failing must not stop the others
+        except Exception:                 # no data now: the whole catch-up retries on the next update
+            failed.append(name)
             continue
         close_at = feats["timestamp"] + step
         window = feats[(close_at > since) & (close_at <= until)]
@@ -311,7 +373,7 @@ def replay_calls(configs: list[dict], since: pd.Timestamp, until: pd.Timestamp, 
                           "hold": format_duration(hold), "signal_time": signal.isoformat(),
                           "exit_time": (signal + hold).isoformat(), "price": float(close), "confidence": float(p),
                           "verdict": cfg["verdict"], "fee": costs[name]})
-    return calls, closes
+    return calls, closes, failed
 
 
 def catch_up_models(state: dict, calls: list[dict], closes: dict, until: pd.Timestamp, share: float,
@@ -337,11 +399,12 @@ def catch_up_models(state: dict, calls: list[dict], closes: dict, until: pd.Time
             got = broker.sell(acct, p["qty"], price, p["fee"])
             trade = {**p, "closed": p["exit_time"], "exit_price": price, "proceeds": got,
                      "pnl": got - p["invested"], "pnl_pct": got / p["invested"] - 1, "replayed": True}
-            acct["trades"].append(trade)
+            record_trade(acct, trade)
             events.append({"kind": "sell", "trade": trade})
         acct["positions"] = keep
 
-    for c in sorted(calls, key=lambda c: c["signal_time"]):
+    # Same priority as the live scanner when cash is short: validated models first, then the most confident.
+    for c in sorted(calls, key=lambda c: (c["signal_time"], c["verdict"] != VALIDATED, -c["confidence"])):
         sell_due(pd.Timestamp(c["signal_time"]))            # sells free their cash before the next buy
         key = f"{c['config']}|{c['signal_time']}"
         if key in seen_set or c["config"] in {p["config"] for p in acct["positions"]}:
@@ -363,18 +426,23 @@ def catch_up_models(state: dict, calls: list[dict], closes: dict, until: pd.Time
     return events
 
 
-def catch_up_trend(state: dict, daily, today: pd.Timestamp, broker=PaperBroker()) -> int:
-    """Rebalance the trend account for every daily decision it missed, at that day's close."""
+def catch_up_trend(state: dict, daily, today: pd.Timestamp, broker=PaperBroker()) -> tuple[int, bool]:
+    """Rebalance the trend account for every daily decision it missed, at that day's close.
+
+    Stops at the first day with missing data and reports (days done, finished?); the rest is
+    retried on the next update.
+    """
     acct = state["accounts"]["trend"]
     if not acct.get("rebalanced_for"):
-        return 0
+        return 0, True
     days = pd.date_range(pd.Timestamp(acct["rebalanced_for"]) + pd.Timedelta("1D"), today - pd.Timedelta("1D"),
                          freq="1D")[-CATCH_UP_MAX.days:]
-    for day in days:
+    for i, day in enumerate(days):
         guide = TG.guide(state["coins"], daily, day)
         prices = {c["symbol"]: c["price"] for c in guide if c.get("price") is not None}
-        step_trend(state, prices, day, broker, guide=guide, day=day.isoformat())
-    return len(days)
+        if step_trend(state, prices, day, broker, guide=guide, day=day.isoformat()) is None:
+            return i, False
+    return len(days), True
 
 
 def catch_up_text(gap: pd.Timedelta, events: list[dict], trend_days: int) -> str:
@@ -387,7 +455,7 @@ def catch_up_text(gap: pd.Timedelta, events: list[dict], trend_days: int) -> str
                  + (f" ({sum(t['pnl'] for t in sells):+,.2f} USDT)" if sells else ""))
     lines.append(f"• trend guide: rebalanced for {trend_days} missed day(s)")
     if gap > CATCH_UP_MAX:
-        lines.append(f"Only the last {CATCH_UP_MAX.days} days were replayed.")
+        lines.append(f"Only the last {CATCH_UP_MAX.days} days were replayed; the rest doesn't count toward the 90 days.")
     return "\n".join(lines)
 
 
@@ -395,22 +463,24 @@ def catch_up_text(gap: pd.Timedelta, events: list[dict], trend_days: int) -> str
 
 def go_live_checks(state: dict, now: pd.Timestamp) -> list[dict]:
     """What has to be true before copying the model calls with real money makes sense."""
-    days = (now - pd.Timestamp(state["started"])).days
+    days = int((now - pd.Timestamp(state["started"])).total_seconds() - state.get("uncovered_s", 0.0)) // 86400
     prices = state["prices"]
     models, hold = state["accounts"]["models"], state["accounts"]["hold"]
-    trades = models["trades"]
+    stats = models.get("stats") or {"count": len(models["trades"]), "pnl": sum(t["pnl"] for t in models["trades"]),
+                                    "validated": sum(t.get("verdict") == VALIDATED for t in models["trades"])}
     r_models = account_value(models, prices) / models["start_cash"] - 1
     r_hold = account_value(hold, prices) / hold["start_cash"] - 1
-    validated = sum(t.get("verdict") == VALIDATED for t in trades)
     return [
         {"label": f"At least {GO_LIVE_DAYS} days of pretend trading", "ok": days >= GO_LIVE_DAYS,
-         "detail": f"{days} days so far"},
-        {"label": f"At least {GO_LIVE_TRADES} finished pretend trades", "ok": len(trades) >= GO_LIVE_TRADES,
-         "detail": f"{len(trades)} so far"},
-        {"label": "Copying the model calls beat buy & hold, after fees", "ok": bool(trades) and r_models > r_hold,
-         "detail": f"{r_models:+.2%} vs {r_hold:+.2%}"},
-        {"label": "The copied models passed the edge check on unseen data", "ok": bool(trades) and validated == len(trades),
-         "detail": f"{validated} of {len(trades)} trades came from validated models"},
+         "detail": f"{max(days, 0)} days so far"},
+        {"label": f"At least {GO_LIVE_TRADES} finished pretend trades", "ok": stats["count"] >= GO_LIVE_TRADES,
+         "detail": f"{stats['count']} so far"},
+        {"label": "Copying the model calls made money and beat buy & hold, after fees",
+         "ok": stats["count"] > 0 and stats["pnl"] > 0 and r_models > max(r_hold, 0.0),
+         "detail": f"{r_models:+.2%} vs {r_hold:+.2%} for buy & hold; finished trades {stats['pnl']:+,.2f} USDT"},
+        {"label": "The copied models passed the edge check on unseen data",
+         "ok": stats["count"] > 0 and stats["validated"] == stats["count"],
+         "detail": f"{stats['validated']} of {stats['count']} trades came from validated models"},
     ]
 
 
@@ -447,7 +517,13 @@ def report_text(state: dict, now: pd.Timestamp) -> str:
         lines.append(f"Model trades finished in the last day: {len(done)} ({wins} won), "
                      f"{sum(t['pnl'] for t in done):+,.2f} USDT")
     up = [f"{TG.coin_name(c['symbol'])} {c['exposure']:.0%}" for c in s["guide"] if (c.get("exposure") or 0) > 0]
-    lines.append("Trend guide, keep in coin: " + (", ".join(up) if up else "nothing (all trends down: hold USDT)"))
+    unknown = [TG.coin_name(c["symbol"]) for c in s["guide"] if c.get("exposure") is None and c["trend"] != "UNTESTED"]
+    if up:
+        lines.append("Trend guide, keep in coin: " + ", ".join(up))
+    elif s["guide"] and not unknown:
+        lines.append("Trend guide: all trends are down, hold USDT.")
+    if unknown:
+        lines.append("Trend guide has no data yet for: " + ", ".join(unknown))
     lines.append("Not financial advice.")
     return "\n".join(lines)
 
@@ -469,12 +545,15 @@ def run_once(now: pd.Timestamp | None = None, path: Path = STATE_PATH, scan_fn=s
              replay_fn=None) -> dict:
     now = now or pd.Timestamp.now(tz="UTC")
     cfg = cfg or settings()
-    state = load_state(path) or new_state(now, cfg)
-    log = []
+    state = load_state(path, repair=True) or new_state(now, cfg)
+    log = list(cfg.get("notes", []))
     messages = []
     today = now.floor("D").isoformat()
-    last_run = pd.Timestamp(state["last_run"]) if state.get("last_run") else None
-    gap = now - last_run if last_run is not None else pd.Timedelta(0)
+    # The catch-up cursor only moves when a whole update finished with all the data it needed,
+    # so a pause is replayed even if the first update after it is cut short or offline.
+    synced = state.get("synced_until") or state.get("last_run")
+    synced = pd.Timestamp(synced) if synced else None
+    gap = now - synced if synced is not None else pd.Timedelta(0)
     catching_up = gap > CATCH_UP_AFTER
     days_cache: dict = {}
 
@@ -483,21 +562,22 @@ def run_once(now: pd.Timestamp | None = None, path: Path = STATE_PATH, scan_fn=s
             days_cache[sym] = daily_fn(sym)
         return days_cache[sym]
 
-    trend_days = catch_up_trend(state, daily, now.floor("D")) if catching_up else 0
+    trend_days, trend_done = catch_up_trend(state, daily, now.floor("D")) if catching_up else (0, True)
     if state["guide_day"] != today:                  # the daily rule decides once per UTC day
         new_guide = TG.guide(state["coins"], daily, now)
-        messages += TG.changes(state["guide"], new_guide)
-        state["guide"] = new_guide
         if not any(c["trend"] == "ERROR" for c in new_guide):
+            messages += TG.changes(state["guide"], new_guide)
+            state["guide"] = new_guide
             state["guide_day"] = today
-        else:
-            log.append("some coins had no daily data; the guide retries on the next update")
+        else:                                        # keep the last complete guide (and its alerts) until then
+            log.append("some coins had no daily data; the trend guide retries on the next update")
 
-    wanted = set(state["coins"]) | {p["symbol"] for p in state["accounts"]["models"]["positions"]}
-    state["prices"].update(prices_fn(wanted))
-    step_hold(state, state["prices"])
-    if state["guide_day"] == today:
-        step_trend(state, state["prices"], now)
+    fresh = prices_fn(set(state["coins"]) | {p["symbol"] for p in state["accounts"]["models"]["positions"]})
+    state["prices"].update(fresh)
+    step_hold(state, fresh)
+    if state["guide_day"] == today and trend_done:
+        if step_trend(state, fresh, now) is None:
+            log.append("no price for some coins; the trend account rebalances on the next update")
     state["last_run"] = now.isoformat()
     save_state(state, path)        # the dashboard fills in now; checking every token model below can take minutes
 
@@ -506,32 +586,52 @@ def run_once(now: pd.Timestamp | None = None, path: Path = STATE_PATH, scan_fn=s
     except Exception as exc:
         rows = []
         log.append(f"scan failed: {exc}")
-    calls = {r["symbol"] for r in rows if r.get("direction") == "UP"} - set(state["prices"])
-    if calls:
-        state["prices"].update(prices_fn(calls))
+    positions = state["accounts"]["models"]["positions"]
+    now_prices = prices_fn({r["symbol"] for r in rows if r.get("direction") == "UP"} | {p["symbol"] for p in positions})
+    state["prices"].update(now_prices)
     costs = costs_fn()
     events = []
+    models_done = True
     if catching_up:
-        since = max(last_run, now - CATCH_UP_MAX)
+        since = max(synced, now - CATCH_UP_MAX)
+        reach = {}
+        for p in positions:
+            key = (p["symbol"], p["interval"])
+            reach[key] = min(reach.get(key, now), pd.Timestamp(p["exit_time"]))
         try:
             if replay_fn is None:
-                missed, closes = replay_calls(load_configs(EXPERIMENTS_DIR), since, now, costs)
+                missed, closes, failed = replay_calls(load_configs(EXPERIMENTS_DIR), since, now, costs, reach=reach)
             else:
-                missed, closes = replay_fn(since, now, costs)
-            events = catch_up_models(state, missed, closes, now, cfg["trade_share"])
+                missed, closes, failed = replay_fn(since, now, costs)
         except Exception as exc:
-            log.append(f"could not replay the missed model calls: {exc}")
+            missed, closes, failed = [], {}, [f"replay error: {exc}"]
+        models_done = not failed
+        if models_done:
+            events = catch_up_models(state, missed, closes, now, cfg["trade_share"])
+            unpriced = {p["symbol"] for p in state["accounts"]["models"]["positions"]} - set(now_prices)
+            if unpriced:
+                got = prices_fn(unpriced)
+                now_prices.update(got)
+                state["prices"].update(got)
+    if models_done:
+        events += step_models(state, rows, now_prices, costs, now, cfg["trade_share"])
+    else:                         # trading now would skip the missed time for good: wait for the data
+        log.append(f"no market data for {len(failed)} model(s) ({', '.join(failed[:3])}); "
+                   "the pretend trades wait and the catch-up retries on the next update")
+    log += [e["text"] for e in events if e["kind"] == "skip"]
+    caught_up = catching_up and models_done and trend_done
+    if caught_up:
         messages.append(catch_up_text(gap, events, trend_days))
         log.append(f"caught up {gap}: {len(events)} replayed trades, {trend_days} trend day(s)")
-        unpriced = {p["symbol"] for p in state["accounts"]["models"]["positions"]} - set(state["prices"])
-        if unpriced:
-            state["prices"].update(prices_fn(unpriced))
-    events += step_models(state, rows, state["prices"], costs, now, cfg["trade_share"])
-    log += [e["text"] for e in events if e["kind"] == "skip"]
+        if gap > CATCH_UP_MAX:
+            state["uncovered_s"] = state.get("uncovered_s", 0.0) + (gap - CATCH_UP_MAX).total_seconds()
+    elif catching_up and not trend_done:
+        log.append("no daily data for the trend catch-up; it retries on the next update")
 
+    priced = set(fresh) | set(now_prices)
     for acct in state["accounts"].values():
         last = pd.Timestamp(acct["equity"][-1][0]) if acct["equity"] else None
-        if last is None or now - last >= EQUITY_EVERY or events:
+        if account_symbols(acct) <= priced and (last is None or now - last >= EQUITY_EVERY or events):
             acct["equity"] = (acct["equity"] + [[now.isoformat(), round(account_value(acct, state["prices"]), 4)]])[-MAX_HISTORY:]
 
     if cfg["trade_alerts"]:                          # replayed trades are summed up in the catch-up message
@@ -550,6 +650,8 @@ def run_once(now: pd.Timestamp | None = None, path: Path = STATE_PATH, scan_fn=s
 
     state["log"] = (state["log"] + [f"{now:%Y-%m-%d %H:%M} {line}" for line in log])[-50:]
     state["last_run"] = now.isoformat()
+    if not catching_up or caught_up:
+        state["synced_until"] = now.isoformat()
     save_state(state, path)
     return state
 
@@ -579,15 +681,16 @@ def main(argv=None):
     p.add_argument("--watch", type=float, metavar="MINUTES", help="update every MINUTES")
     p.add_argument("--reset", action="store_true", help="delete the pretend accounts and start again")
     args = p.parse_args(argv)
-    if args.reset and STATE_PATH.exists():
-        STATE_PATH.unlink()
+    if args.reset:
+        for f in (STATE_PATH, _backup(STATE_PATH)):
+            f.unlink(missing_ok=True)
         print("Pretend accounts deleted; the next update starts fresh.")
     while True:
         try:
             run_once()
+            print(format_status(status()) + "\n", flush=True)
         except Exception as exc:          # keep the loop alive through network trouble
             print(f"update failed: {type(exc).__name__}: {exc}", flush=True)
-        print(format_status(status()) + "\n", flush=True)
         if args.watch is None:
             break
         time.sleep(args.watch * 60)

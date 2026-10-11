@@ -341,13 +341,6 @@ def run_once(now: pd.Timestamp | None = None, path: Path = STATE_PATH, scan_fn=s
     cfg = cfg or settings()
     state = load_state(path) or new_state(now, cfg)
     log = []
-
-    try:
-        rows = scan_fn()
-    except Exception as exc:
-        rows = []
-        log.append(f"scan failed: {exc}")
-
     messages = []
     today = now.floor("D").isoformat()
     if state["guide_day"] != today:                  # the daily rule decides once per UTC day
@@ -360,13 +353,22 @@ def run_once(now: pd.Timestamp | None = None, path: Path = STATE_PATH, scan_fn=s
             log.append("some coins had no daily data; the guide retries on the next update")
 
     wanted = set(state["coins"]) | {p["symbol"] for p in state["accounts"]["models"]["positions"]}
-    wanted |= {r["symbol"] for r in rows if r.get("direction") == "UP"}
     state["prices"].update(prices_fn(wanted))
-
-    events = step_models(state, rows, state["prices"], costs_fn(), now, cfg["trade_share"])
     step_hold(state, state["prices"])
     if state["guide_day"] == today:
         step_trend(state, state["prices"], now)
+    state["last_run"] = now.isoformat()
+    save_state(state, path)        # the dashboard fills in now; checking every token model below can take minutes
+
+    try:
+        rows = scan_fn()
+    except Exception as exc:
+        rows = []
+        log.append(f"scan failed: {exc}")
+    calls = {r["symbol"] for r in rows if r.get("direction") == "UP"} - set(state["prices"])
+    if calls:
+        state["prices"].update(prices_fn(calls))
+    events = step_models(state, rows, state["prices"], costs_fn(), now, cfg["trade_share"])
     log += [e["text"] for e in events if e["kind"] == "skip"]
 
     for acct in state["accounts"].values():

@@ -764,14 +764,43 @@
           const status = (t.open ? `holding, sells ${fmtShort(t.exit_time)}` : `sold ${fmtShort(t.closed)}`) +
             (t.replayed ? " · caught up" : "");
           const now = t.open ? (t.price == null ? "—" : fmtPrice(t.price)) : fmtPrice(t.exit_price);
+          // Split the result: how much the price moved, and how much the fees took.
+          const move = t.price_move ?? ((t.open ? t.price ?? t.entry_price : t.exit_price) / t.entry_price - 1);
+          const fees = t.open ? t.fees_pct : t.fees != null ? -t.fees / t.invested : -(1 - (1 - t.fee) ** 2);
           return `<tr><td>${esc(baseAsset(t.symbol))} <span class="muted">${esc(t.interval)}</span></td><td>${esc(status)}</td>` +
-            `<td>${fmtPrice(t.entry_price)}</td><td>${now}</td><td class="${res >= 0 ? "up" : "down"}">${fmtSignedPct(res)}</td></tr>`;
+            `<td>${fmtPrice(t.entry_price)}</td><td>${now}</td><td class="${res >= 0 ? "up" : "down"}">${fmtSignedPct(res)}` +
+            `<span class="split">price ${fmtSignedPct(move)} · fees ${fmtSignedPct(fees)}</span></td></tr>`;
         }).join("")
       : '<tr><td colspan="5">No pretend trades yet.</td></tr>';
-    $("ap-trades-note").innerHTML =
-      "It buys when a token model from the market scanner makes a confident UP call, holds for the model's hold time, " +
-      "then sells (fees included). If the scanner is empty, train the models first: " +
-      "<code>docker compose run --rm web python -m cryptopredict.experiments --jobs 2</code>.";
+
+    const w = d.why;
+    $("ap-why").innerHTML = w && w.count
+      ? `<p>Finished trades: <b>${w.count}</b> · won <b>${w.wins}</b> (${fmtPct(w.win_rate, 0)})` +
+        (w.avg_win != null ? ` · average win <b class="up">+${fmtMoney(w.avg_win)}</b>` : "") +
+        (w.avg_loss != null ? ` · average loss <b class="down">−${fmtMoney(Math.abs(w.avg_loss))}</b>` : "") + ` USDT.</p>` +
+        `<p>Result <b class="${w.pnl >= 0 ? "up" : "down"}">${w.pnl >= 0 ? "+" : "−"}${fmtMoney(Math.abs(w.pnl))} USDT</b>, ` +
+        `of which fees <b class="down">−${fmtMoney(w.fees)} USDT</b>. Before fees the trades made ` +
+        `<b class="${w.pnl_before_fees >= 0 ? "up" : "down"}">${w.pnl_before_fees >= 0 ? "+" : "−"}${fmtMoney(Math.abs(w.pnl_before_fees))} USDT</b>` +
+        `${w.pnl < 0 && w.pnl_before_fees >= 0 ? ": the price calls were fine, the fees ate the profit" : ""}.</p>` +
+        `<table class="models"><thead><tr><th>Model</th><th>Trades</th><th>Won</th><th>Result</th></tr></thead><tbody>` +
+        w.by_model.slice(0, 8).map((m) => `<tr><td>${esc(m.config.replace(/_/g, " "))}` +
+          `${m.verdict === "POSSIBLE EDGE" ? "" : ' <span class="muted">(failed edge check)</span>'}</td>` +
+          `<td>${m.trades}</td><td>${m.wins}</td><td class="${m.pnl >= 0 ? "up" : "down"}">${m.pnl >= 0 ? "+" : "−"}${fmtMoney(Math.abs(m.pnl))}</td></tr>`).join("") +
+        `</tbody></table>`
+      : "";
+
+    const c = d.copy;
+    let note = "It buys when a token model from the market scanner makes a confident UP call, holds for the model's hold time, then sells, fees included. ";
+    if (c && c.all) {
+      note += "It copies <b>every</b> model's calls (AUTOPILOT_COPY_ALL=1), including models that failed the edge check.";
+    } else if (c) {
+      note += `It only copies models that passed the edge check: <b>${c.validated} of ${c.models}</b> right now. `;
+      if (!c.validated) note += "None did, so this account keeps its cash and waits. Trades it already holds finish on their own schedule.";
+    }
+    if (c && !c.models) {
+      note += " The scanner has no models yet: <code>docker compose run --rm web python -m cryptopredict.experiments --jobs 2</code>.";
+    }
+    $("ap-trades-note").innerHTML = note;
 
     $("ap-checks").innerHTML = d.checks
       .map((c) => `<li class="${c.ok ? "ok" : "no"}">${c.ok ? "✓" : "✗"} ${esc(c.label)} <span class="muted">(${esc(c.detail)})</span></li>`)

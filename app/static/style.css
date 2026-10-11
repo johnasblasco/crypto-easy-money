@@ -286,6 +286,11 @@ td { font-variant-numeric: tabular-nums; }
 .ap-grid h3, #ap-body > h3 { font-size: 14px; margin: 8px 0 6px; }
 .ap-guide td:nth-child(2), .ap-guide th:nth-child(2) { text-align: left; }
 .ap-trades td:nth-child(2), .ap-trades th:nth-child(2) { text-align: left; white-space: normal; min-width: 100px; }
+.ap-trades .split { display: block; font-size: 11px; color: var(--text-muted); font-weight: 400; }
+.ap-why { font-size: 13px; margin-top: 10px; color: var(--text-secondary); }
+.ap-why p { margin: 0 0 6px; }
+.ap-why b { color: var(--text-primary); }
+.ap-why table { margin-top: 4px; font-size: 12px; }
 .ap-checks { list-style: none; padding: 0; margin: 0; font-size: 13px; display: grid; gap: 4px; }
 .ap-checks .ok { color: var(--up-text); }
 .ap-checks .no { color: var(--text-muted); }

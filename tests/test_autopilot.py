@@ -21,7 +21,7 @@ def daily(trend: float, days: int = 300, end: pd.Timestamp = NOW.floor("D")):
 
 
 def row(symbol="SOLUSDT", conf=0.62, thr=0.58, direction="UP", signal_time=NOW - pd.Timedelta("20min"),
-        hold="4 hours", interval="1h", horizon=4, verdict="NO EDGE", price=150.0):
+        hold="4 hours", interval="1h", horizon=4, verdict="POSSIBLE EDGE", price=150.0):
     return {"symbol": symbol, "interval": interval, "horizon": horizon, "verdict": verdict, "status": "NOT VALIDATED",
             "direction": direction, "confidence": conf, "threshold": thr, "price": price, "hold": hold,
             "signal_time": signal_time.isoformat(), "exit_time": (signal_time + pd.Timedelta(hold)).isoformat()}
@@ -212,7 +212,7 @@ def test_replay_finds_the_calls_the_live_scan_would_have_seen():
     until = pd.Timestamp("2026-10-11 06:00", tz="UTC")
     since = until - pd.Timedelta("6h")
     df = candles(until - pd.Timedelta("1h"))              # last candle closes exactly at `until`
-    cfg = {"symbol": "SOLUSDT", "interval": "1h", "horizon": 2, "verdict": "NO EDGE",
+    cfg = {"symbol": "SOLUSDT", "interval": "1h", "horizon": 2, "verdict": "POSSIBLE EDGE",
            "bundle": {"features": ["close"], "threshold": 0.6, "model": CycleModel([0.7, 0.4, 0.55])}}
     calls, closes, failed = A.replay_calls([cfg], since, until, {"SOLUSDT_1h_h2": 0.001}, load=lambda s, i, n: df)
     assert failed == []
@@ -411,9 +411,10 @@ def test_trade_history_is_capped_but_totals_count_everything(monkeypatch):
     monkeypatch.setattr(A, "MAX_HISTORY", 5)
     acct = A.new_state(NOW, CFG)["accounts"]["models"]
     for i in range(12):
-        A.record_trade(acct, {"pnl": 1.0, "verdict": "NO EDGE", "i": i})
+        A.record_trade(acct, {"pnl": 1.0, "verdict": "NO EDGE", "i": i, "fees": 0.2})
     assert len(acct["trades"]) == 5 and acct["trades"][-1]["i"] == 11
-    assert acct["stats"] == {"count": 12, "validated": 0, "pnl": 12.0}
+    assert acct["stats"] == {"count": 12, "validated": 0, "pnl": 12.0, "wins": 12, "fees": pytest.approx(2.4),
+                             "win_pnl": 12.0, "loss_pnl": 0.0}
 
 
 def test_a_guide_with_missing_data_keeps_the_last_complete_one_and_its_alerts(tmp_path):
@@ -434,3 +435,65 @@ def test_a_guide_with_missing_data_keeps_the_last_complete_one_and_its_alerts(tm
     run_with(tmp_path, day2 + pd.Timedelta("15min"), {"BTCUSDT": 100.0, "ETHUSDT": 10.0}, sent=sent,
              daily_fn=lambda s: daily(0.004, end=day2.floor("D")))
     assert any("BTC trend turned UP" in m for m in sent)            # not lost to the failed attempt
+
+
+# ------------------------------------------------------------ copying only validated models, and why it loses
+
+def test_models_that_failed_the_edge_check_are_not_copied_unless_asked():
+    weak = row(verdict="NO EDGE")
+    st = models_state()
+    assert A.step_models(st, [weak], {"SOLUSDT": 150.0}, {"SOLUSDT_1h_h4": 0.001}, NOW, 0.1) == []
+    ev = A.step_models(st, [weak], {"SOLUSDT": 150.0}, {"SOLUSDT_1h_h4": 0.001}, NOW, 0.1, copy_all=True)
+    assert [e["kind"] for e in ev] == ["buy"]
+
+
+def test_replay_skips_weak_models_but_still_prices_their_open_trades():
+    until = pd.Timestamp("2026-10-11 06:00", tz="UTC")
+    df = candles(until - pd.Timedelta("1h"))
+    loads = []
+
+    def load(s, i, n):
+        loads.append(s)
+        return df
+
+    cfg = {"symbol": "SOLUSDT", "interval": "1h", "horizon": 2, "verdict": "NO EDGE",
+           "bundle": {"features": ["close"], "threshold": 0.6, "model": CycleModel([0.9])}}
+    costs = {"SOLUSDT_1h_h2": 0.001}
+    assert A.replay_calls([cfg], until - pd.Timedelta("6h"), until, costs, load=load) == ([], {}, [])
+    assert loads == []                                               # not even downloaded
+    calls, closes, failed = A.replay_calls([cfg], until - pd.Timedelta("6h"), until, costs, load=load,
+                                           reach={("SOLUSDT", "1h"): until - pd.Timedelta("3h")})
+    assert calls == [] and ("SOLUSDT", "1h") in closes and failed == []   # an open trade still gets its exit price
+
+
+def test_each_trade_shows_price_move_and_fees_separately():
+    st = models_state()
+    costs = {"SOLUSDT_1h_h4": 0.001}
+    A.step_models(st, [row()], {"SOLUSDT": 100.0}, costs, NOW, 0.10)
+    s = A.summary({**st, "prices": {"SOLUSDT": 99.85}}, NOW)          # BTC-like: -0.15% so far
+    o = s["open_trades"][0]
+    assert o["price_move"] == pytest.approx(-0.0015)
+    assert o["fees_pct"] == pytest.approx(-(1 - 0.999 ** 2))
+    assert o["pnl_pct"] == pytest.approx(0.9985 * 0.999 ** 2 - 1)    # = about price move + fees
+    ev = A.step_models(st, [], {"SOLUSDT": 101.0}, costs, NOW + pd.Timedelta("4h"), 0.10)
+    t = ev[0]["trade"]
+    assert t["price_move"] == pytest.approx(0.01)
+    assert t["fees"] == pytest.approx(100 * 0.001 + t["qty"] * 101 * 0.001)
+
+
+def test_why_breakdown_sums_wins_losses_fees_and_per_model():
+    acct = models_state()["accounts"]["models"]
+    for cfg, pnl in (("A_1h_h1", 2.0), ("A_1h_h1", -1.0), ("B_1d_h1", -3.0)):
+        A.record_trade(acct, {"config": cfg, "verdict": "NO EDGE", "pnl": pnl, "fees": 0.25})
+    w = A.why(acct)
+    assert (w["count"], w["wins"]) == (3, 1) and w["win_rate"] == pytest.approx(1 / 3)
+    assert w["avg_win"] == 2.0 and w["avg_loss"] == -2.0
+    assert w["pnl"] == -2.0 and w["fees"] == pytest.approx(0.75) and w["pnl_before_fees"] == pytest.approx(-1.25)
+    assert [m["config"] for m in w["by_model"]] == ["B_1d_h1", "A_1h_h1"]   # worst first
+
+
+def test_run_once_records_the_copy_rule(tmp_path):
+    st = run(tmp_path, NOW, rows=[row(symbol="ETHUSDT", verdict="NO EDGE"), row(verdict="POSSIBLE EDGE")])
+    assert st["copy"] == {"all": False, "models": 2, "validated": 1}
+    assert st["accounts"]["models"]["name"] == "Copy validated model calls"
+    assert [p["symbol"] for p in st["accounts"]["models"]["positions"]] == ["SOLUSDT"]

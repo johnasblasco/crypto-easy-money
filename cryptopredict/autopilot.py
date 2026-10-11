@@ -7,10 +7,11 @@ Usage:
 
 Three pretend accounts start with the same money (AUTOPILOT_START_CASH, default 1000 USDT):
 
-* Copy the model calls: whenever a token model from ``cryptopredict.experiments`` makes a
-  confident UP call (confidence at or above its own threshold), buy AUTOPILOT_TRADE_PCT % of
-  the starting money (default 10%), hold for the model's hold time, then sell. Validated or
-  not: the point is to see, live, whether the calls make money after fees.
+* Copy the model calls: whenever a token model from ``cryptopredict.experiments`` that passed
+  the edge check makes a confident UP call (confidence at or above its own threshold), buy
+  AUTOPILOT_TRADE_PCT % of the starting money (default 10%), hold for the model's hold time,
+  then sell. Models that failed the edge check are not copied (they lost to fees in the live
+  test); AUTOPILOT_COPY_ALL=1 copies them anyway, to watch them lose with pretend money.
 * Follow the trend guide: split the money equally over the guide coins and keep in each the
   share the daily trend rule suggests, rebalanced once a day after 00:00 UTC.
 * Buy & hold: buy the guide coins equally on the first day and never trade. The yardstick.
@@ -79,6 +80,7 @@ def settings() -> dict:
             "trade_share": _setting("AUTOPILOT_TRADE_PCT", 10.0, float, lambda v: 0 < v <= 100, notes) / 100,
             "report_hour": _setting("AUTOPILOT_REPORT_HOUR", 1, int, lambda v: 0 <= v <= 23, notes),
             "trade_alerts": (os.environ.get("AUTOPILOT_TRADE_ALERTS") or "").strip().lower() in ("1", "true", "yes", "on"),
+            "copy_all": (os.environ.get("AUTOPILOT_COPY_ALL") or "").strip().lower() in ("1", "true", "yes", "on"),
             "coins": coins or list(UNIVERSE), "notes": notes}
 
 
@@ -109,11 +111,15 @@ def new_state(now: pd.Timestamp, cfg: dict) -> dict:
 
     return {"version": 1, "started": now.isoformat(), "coins": cfg["coins"], "broker": PaperBroker.name,
             "accounts": {"models": account("Copy the model calls", positions=[],
-                                           stats={"count": 0, "validated": 0, "pnl": 0.0}),
+                                           stats=new_stats()),
                          "trend": account("Follow the trend guide", holdings={}, rebalanced_for=None),
                          "hold": account("Just buy and hold", holdings={})},
             "seen_signals": [], "guide": None, "guide_day": None, "prices": {}, "last_report": None,
             "last_run": None, "synced_until": None, "uncovered_s": 0.0, "log": []}
+
+
+def new_stats() -> dict:
+    return {"count": 0, "validated": 0, "pnl": 0.0, "wins": 0, "fees": 0.0, "win_pnl": 0.0, "loss_pnl": 0.0}
 
 
 def _backup(path: Path) -> Path:
@@ -159,13 +165,39 @@ def account_symbols(acct: dict) -> set:
     return set(acct.get("holdings", {})) | {p["symbol"] for p in acct.get("positions", [])}
 
 
+def trade_fees(t: dict) -> float:
+    """Fees of a finished trade in USDT: on the money put in, and on the sale."""
+    if "fees" in t:
+        return t["fees"]
+    return t["invested"] * t["fee"] + t["qty"] * t["exit_price"] * t["fee"]
+
+
 def record_trade(acct: dict, trade: dict) -> None:
     """Keep the last MAX_HISTORY trades, and running totals over all of them for the checks."""
-    stats = acct.setdefault("stats", {"count": 0, "validated": 0, "pnl": 0.0})
+    stats = acct.setdefault("stats", new_stats())
+    for key, value in new_stats().items():         # states saved before a total existed
+        stats.setdefault(key, value)
     stats["count"] += 1
     stats["validated"] += trade.get("verdict") == VALIDATED
     stats["pnl"] += trade["pnl"]
+    stats["fees"] += trade_fees(trade)
+    if trade["pnl"] > 0:
+        stats["wins"] += 1
+        stats["win_pnl"] += trade["pnl"]
+    else:
+        stats["loss_pnl"] += trade["pnl"]
     acct["trades"] = (acct["trades"] + [trade])[-MAX_HISTORY:]
+
+
+def close_trade(acct: dict, p: dict, price: float, closed: str, broker, replayed: bool = False) -> dict:
+    got = broker.sell(acct, p["qty"], price, p["fee"])
+    trade = {**p, "closed": closed, "exit_price": price, "proceeds": got, "pnl": got - p["invested"],
+             "pnl_pct": got / p["invested"] - 1, "price_move": price / p["entry_price"] - 1,
+             "fees": p["invested"] * p["fee"] + p["qty"] * price * p["fee"]}
+    if replayed:
+        trade["replayed"] = True
+    record_trade(acct, trade)
+    return trade
 
 
 # ------------------------------------------------------------------ market data
@@ -223,7 +255,7 @@ def config_name(row: dict) -> str:
 
 
 def step_models(state: dict, rows: list[dict], prices: dict, costs: dict, now: pd.Timestamp,
-                share: float, broker=PaperBroker()) -> list[dict]:
+                share: float, broker=PaperBroker(), copy_all: bool = False) -> list[dict]:
     """Sell finished pretend trades, then copy every new confident UP call. Returns the events.
 
     ``prices`` must hold only prices fetched in this update: a finished trade without one waits
@@ -237,11 +269,7 @@ def step_models(state: dict, rows: list[dict], prices: dict, costs: dict, now: p
         if pd.Timestamp(p["exit_time"]) > now or price is None:
             still.append(p)
             continue
-        got = broker.sell(acct, p["qty"], price, p["fee"])
-        trade = {**p, "closed": now.isoformat(), "exit_price": price, "proceeds": got,
-                 "pnl": got - p["invested"], "pnl_pct": got / p["invested"] - 1}
-        record_trade(acct, trade)
-        events.append({"kind": "sell", "trade": trade})
+        events.append({"kind": "sell", "trade": close_trade(acct, p, price, now.isoformat(), broker)})
     acct["positions"] = still
     open_configs = {p["config"] for p in still}
     seen = list(state["seen_signals"])
@@ -249,6 +277,8 @@ def step_models(state: dict, rows: list[dict], prices: dict, costs: dict, now: p
     for r in rows:
         if r.get("status") == "ERROR" or r.get("direction") != "UP" or r.get("confidence", 0) < r.get("threshold", 1):
             continue
+        if not copy_all and r.get("verdict") != VALIDATED:
+            continue                       # failed the edge check: its calls lose to fees
         cfg = config_name(r)
         key = f"{cfg}|{r['signal_time']}"
         signal_age = now - pd.Timestamp(r["signal_time"])
@@ -326,7 +356,7 @@ def step_hold(state: dict, prices: dict, broker=PaperBroker()) -> None:
 # ------------------------------------------------------------------ catching up after a pause
 
 def replay_calls(configs: list[dict], since: pd.Timestamp, until: pd.Timestamp, costs: dict,
-                 load=None, reach: dict | None = None) -> tuple[list[dict], dict, list[str]]:
+                 load=None, reach: dict | None = None, copy_all: bool = False) -> tuple[list[dict], dict, list[str]]:
     """What the live scan would have seen while the autopilot was off.
 
     Returns every confident UP call each Binance-trained model made on candles that closed in
@@ -343,11 +373,12 @@ def replay_calls(configs: list[dict], since: pd.Timestamp, until: pd.Timestamp, 
     calls, closes, candles, failed = [], {}, {}, []
     for cfg in configs:
         name = config_name(cfg)
-        if name not in costs:
-            continue
+        key = (cfg["symbol"], cfg["interval"])
+        copied = copy_all or cfg["verdict"] == VALIDATED
+        if name not in costs or not (copied or key in reach):
+            continue                      # not copied, and no open trade of it to price
         step = pd.Timedelta(milliseconds=INTERVAL_MS[cfg["interval"]])
         hold = hold_time(cfg["interval"], cfg["horizon"])
-        key = (cfg["symbol"], cfg["interval"])
         try:
             if key not in candles:
                 start = min(since, reach.get(key, since))
@@ -361,7 +392,7 @@ def replay_calls(configs: list[dict], since: pd.Timestamp, until: pd.Timestamp, 
             continue
         close_at = feats["timestamp"] + step
         window = feats[(close_at > since) & (close_at <= until)]
-        if window.empty:
+        if window.empty or not copied:
             continue
         prob_up = bundle["model"].predict_proba(window[bundle["features"]].astype(float))[:, 1]
         need = max(0.5, bundle.get("threshold", 0.5))      # an UP call at or above the model's own threshold
@@ -396,11 +427,7 @@ def catch_up_models(state: dict, calls: list[dict], closes: dict, until: pd.Time
             if price is None:
                 keep.append(p)
                 continue
-            got = broker.sell(acct, p["qty"], price, p["fee"])
-            trade = {**p, "closed": p["exit_time"], "exit_price": price, "proceeds": got,
-                     "pnl": got - p["invested"], "pnl_pct": got / p["invested"] - 1, "replayed": True}
-            record_trade(acct, trade)
-            events.append({"kind": "sell", "trade": trade})
+            events.append({"kind": "sell", "trade": close_trade(acct, p, price, p["exit_time"], broker, replayed=True)})
         acct["positions"] = keep
 
     # Same priority as the live scanner when cash is short: validated models first, then the most confident.
@@ -492,16 +519,47 @@ def summary(state: dict, now: pd.Timestamp) -> dict:
         accounts.append({"key": key, "name": acct["name"], "value": value, "start_cash": acct["start_cash"],
                          "return": value / acct["start_cash"] - 1, "cash": acct["cash"], "equity": acct["equity"]})
     models = state["accounts"]["models"]
-    open_trades = [{**p, "price": prices.get(p["symbol"]),
-                    "pnl_pct": (prices.get(p["symbol"], p["entry_price"]) * (1 - p["fee"]) * p["qty"]) / p["invested"] - 1}
-                   for p in models["positions"]]
+    open_trades = []
+    for p in models["positions"]:
+        price = prices.get(p["symbol"], p["entry_price"])
+        open_trades.append({**p, "price": prices.get(p["symbol"]),
+                            "pnl_pct": price * (1 - p["fee"]) * p["qty"] / p["invested"] - 1,
+                            "price_move": price / p["entry_price"] - 1,
+                            "fees_pct": -(1 - (1 - p["fee"]) ** 2)})   # buy fee paid + sell fee to come
     last_run = pd.Timestamp(state["last_run"]) if state.get("last_run") else None
     return {"running": last_run is not None and now - last_run < STALE_AFTER, "started": state["started"],
             "last_run": state.get("last_run"), "broker": state.get("broker", "paper"), "accounts": accounts,
             "guide": state.get("guide") or [], "guide_day": state.get("guide_day"),
             "open_trades": open_trades, "recent_trades": models["trades"][-15:][::-1],
             "trend_trades": state["accounts"]["trend"]["trades"][-10:][::-1],
-            "checks": go_live_checks(state, now), "log": state.get("log", [])[-10:]}
+            "checks": go_live_checks(state, now), "log": state.get("log", [])[-10:],
+            "why": why(models), "copy": state.get("copy")}
+
+
+def why(models: dict) -> dict:
+    """Where the copied trades' money went: wins vs losses, fees vs price moves, per model."""
+    trades = models["trades"]
+    stats = {**new_stats(), "count": len(trades), "pnl": sum(t["pnl"] for t in trades),
+             "wins": sum(t["pnl"] > 0 for t in trades), "fees": sum(trade_fees(t) for t in trades),
+             "win_pnl": sum(t["pnl"] for t in trades if t["pnl"] > 0),
+             "loss_pnl": sum(t["pnl"] for t in trades if t["pnl"] <= 0)}
+    if models.get("stats") and all(k in models["stats"] for k in new_stats()):
+        stats = models["stats"]           # totals over every trade, not just the kept history
+    losses = stats["count"] - stats["wins"]
+    by_model: dict = {}
+    for t in trades:
+        m = by_model.setdefault(t["config"], {"config": t["config"], "verdict": t.get("verdict"), "trades": 0,
+                                              "wins": 0, "pnl": 0.0, "fees": 0.0})
+        m["trades"] += 1
+        m["wins"] += t["pnl"] > 0
+        m["pnl"] += t["pnl"]
+        m["fees"] += trade_fees(t)
+    return {"count": stats["count"], "wins": stats["wins"],
+            "win_rate": stats["wins"] / stats["count"] if stats["count"] else None,
+            "avg_win": stats["win_pnl"] / stats["wins"] if stats["wins"] else None,
+            "avg_loss": stats["loss_pnl"] / losses if losses else None,
+            "pnl": stats["pnl"], "fees": stats["fees"], "pnl_before_fees": stats["pnl"] + stats["fees"],
+            "by_model": sorted(by_model.values(), key=lambda m: m["pnl"])}
 
 
 def report_text(state: dict, now: pd.Timestamp) -> str:
@@ -590,6 +648,10 @@ def run_once(now: pd.Timestamp | None = None, path: Path = STATE_PATH, scan_fn=s
     now_prices = prices_fn({r["symbol"] for r in rows if r.get("direction") == "UP"} | {p["symbol"] for p in positions})
     state["prices"].update(now_prices)
     costs = costs_fn()
+    configs = {config_name(r): r.get("verdict") for r in rows if r.get("status") != "ERROR"}
+    state["copy"] = {"all": cfg.get("copy_all", False), "models": len(configs),
+                     "validated": sum(v == VALIDATED for v in configs.values())}
+    state["accounts"]["models"]["name"] = "Copy every model call" if cfg.get("copy_all") else "Copy validated model calls"
     events = []
     models_done = True
     if catching_up:
@@ -600,7 +662,8 @@ def run_once(now: pd.Timestamp | None = None, path: Path = STATE_PATH, scan_fn=s
             reach[key] = min(reach.get(key, now), pd.Timestamp(p["exit_time"]))
         try:
             if replay_fn is None:
-                missed, closes, failed = replay_calls(load_configs(EXPERIMENTS_DIR), since, now, costs, reach=reach)
+                missed, closes, failed = replay_calls(load_configs(EXPERIMENTS_DIR), since, now, costs, reach=reach,
+                                                      copy_all=cfg.get("copy_all", False))
             else:
                 missed, closes, failed = replay_fn(since, now, costs)
         except Exception as exc:
@@ -614,7 +677,7 @@ def run_once(now: pd.Timestamp | None = None, path: Path = STATE_PATH, scan_fn=s
                 now_prices.update(got)
                 state["prices"].update(got)
     if models_done:
-        events += step_models(state, rows, now_prices, costs, now, cfg["trade_share"])
+        events += step_models(state, rows, now_prices, costs, now, cfg["trade_share"], copy_all=cfg.get("copy_all", False))
     else:                         # trading now would skip the missed time for good: wait for the data
         log.append(f"no market data for {len(failed)} model(s) ({', '.join(failed[:3])}); "
                    "the pretend trades wait and the catch-up retries on the next update")

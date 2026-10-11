@@ -181,7 +181,7 @@ Each starts with 1,000 USDT and trades by itself at real Binance prices, with fe
 
 | Account | What it does |
 |---|---|
-| **Copy the model calls** | Whenever a token model from the market scanner makes a confident UP call, it buys 10% of the starting money. It holds for the model's hold time, then sells. |
+| **Copy validated model calls** | Whenever a token model from the market scanner **that passed the edge check** makes a confident UP call, it buys 10% of the starting money. It holds for the model's hold time, then sells. Models that failed the check aren't copied: in the live test their calls lost to fees. While no model passes, this account keeps its cash. |
 | **Follow the trend guide** | It splits the money equally over the coins and keeps in each the share the trend guide says. It rebalances once a day. |
 | **Just buy and hold** | It buys the coins equally on day one and never trades. This is the yardstick. |
 
@@ -228,6 +228,15 @@ again 15 minutes later. It never buys, sells or values anything at an old price.
 A real-money bot can't catch up like that: it has to be running to trade. When
 going live, run it on an always-on machine.
 
+**Why a trade made or lost money.** The trades table splits each result into the
+price move and the fees. Every buy and sell costs about 0.1%, so a round trip
+starts at about −0.2%. A trade whose price rose 0.06% still shows −0.14%. Under
+the table, the card shows:
+- the win rate;
+- the average win and the average loss;
+- the total fees paid, and what the trades made before fees;
+- the result per model.
+
 **Phone alerts.** Set the same Telegram or Discord settings as the scanner in
 `.env`. You then get:
 - a message when a coin's trend turns up or down;
@@ -243,6 +252,7 @@ going live, run it on an always-on machine.
 | `AUTOPILOT_COINS` | Coins for the trend guide and the trend/hold accounts | the 16 main coins |
 | `AUTOPILOT_REPORT_HOUR` | Daily report after this hour (UTC) | `1` |
 | `AUTOPILOT_TRADE_ALERTS` | `1` = a message for every pretend trade | off |
+| `AUTOPILOT_COPY_ALL` | `1` = also copy models that failed the edge check, to watch them lose with pretend money | off |
 
 Changing the start cash or the coins applies after a `--reset`.
 
